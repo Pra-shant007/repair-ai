@@ -1,0 +1,60 @@
+{
+  "database": "repairai_db",
+  "collections": {
+    "users": {
+      "id": "ObjectId",
+      "email": "String (unique, required)",
+      "passwordHash": "String (required)",
+      "fullName": "String (required)",
+      "createdAt": "Date",
+      "updatedAt": "Date"
+    },
+    "diagnostics": {
+      "id": "ObjectId",
+      "userId": "ObjectId (reference to users, optional)",
+      "deviceName": "String (required)",
+      "deviceType": "String (required)",
+      "confidenceScore": "Number (required)",
+      "componentsDetected": [
+        {
+          "name": "String (required)",
+          "bbox": "Array of 4 Numbers [x, y, w, h]",
+          "confidence": "Number"
+        }
+      ],
+      "difficultyScore": "Number (1-100)",
+      "estimatedCost": "Number",
+      "successProbability": "Number (0-100)",
+      "createdAt": "Date"
+    },
+    "repairs": {
+      "id": "ObjectId",
+      "userId": "ObjectId (reference to users, required)",
+      "diagnosisId": "ObjectId (reference to diagnostics, optional)",
+      "deviceName": "String (required)",
+      "deviceType": "String (required)",
+      "scenarioId": "String (required)",
+      "currentStep": "Number (default 0)",
+      "totalSteps": "Number (required)",
+      "status": "String (in_progress, completed, failed)",
+      "steps": [
+        {
+          "stepIndex": "Number (required)",
+          "stepTitle": "String (required)",
+          "safetyRisk": "String (safe, medium, high)",
+          "isCompleted": "Boolean (default false)",
+          "completedAt": "Date"
+        }
+      ],
+      "createdAt": "Date",
+      "updatedAt": "Date"
+    },
+    "reports": {
+      "id": "ObjectId",
+      "userId": "ObjectId (reference to users, required)",
+      "diagnosisId": "ObjectId (reference to diagnostics, required)",
+      "pdfUrl": "String (required)",
+      "createdAt": "Date"
+    }
+  }
+}

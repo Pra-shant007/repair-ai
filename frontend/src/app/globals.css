@@ -1,0 +1,113 @@
+@import "tailwindcss";
+
+@theme {
+  --color-primary: #00f0ff;
+  --color-accent: #8a2be2;
+  --color-bg-dark: #050508;
+  --color-card-dark: #0f0f15;
+}
+
+:root {
+  --background: #050508;
+  --foreground: #f3f4f6;
+  --primary-glow: radial-gradient(rgba(0, 240, 255, 0.15), rgba(0, 0, 0, 0));
+  --accent-glow: radial-gradient(rgba(138, 43, 226, 0.15), rgba(0, 0, 0, 0));
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  overflow-x: hidden;
+}
+
+/* Glassmorphism Panel styles */
+.glass-panel {
+  background: rgba(15, 15, 21, 0.7);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.glass-panel-hover {
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.glass-panel-hover:hover {
+  background: rgba(15, 15, 21, 0.85);
+  border-color: rgba(0, 240, 255, 0.25);
+  box-shadow: 0 0 25px rgba(0, 240, 255, 0.1);
+  transform: translateY(-2px);
+}
+
+/* Custom glowing effects */
+.text-glow {
+  text-shadow: 0 0 10px rgba(0, 240, 255, 0.5);
+}
+
+.text-glow-purple {
+  text-shadow: 0 0 10px rgba(138, 43, 226, 0.5);
+}
+
+.glow-border {
+  border: 1px solid rgba(0, 240, 255, 0.3);
+  box-shadow: 0 0 15px rgba(0, 240, 255, 0.15);
+}
+
+.glow-border-purple {
+  border: 1px solid rgba(138, 43, 226, 0.3);
+  box-shadow: 0 0 15px rgba(138, 43, 226, 0.15);
+}
+
+/* Scrollbar styles */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #050508;
+}
+::-webkit-scrollbar-thumb {
+  background: #1a1a26;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #00f0ff;
+}
+
+/* Pulse keyframes for AI detection indicators */
+@keyframes neon-pulse {
+  0%, 100% {
+    opacity: 0.5;
+    box-shadow: 0 0 5px rgba(0, 240, 255, 0.5);
+  }
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 20px rgba(0, 240, 255, 0.8);
+  }
+}
+
+.neon-indicator {
+  animation: neon-pulse 2s infinite ease-in-out;
+}
+
+/* Soundwave animations for Voice assistant activity */
+.sound-bar {
+  display: inline-block;
+  width: 4px;
+  height: 15px;
+  background-color: #00f0ff;
+  border-radius: 2px;
+  margin: 0 2px;
+}
+
+@keyframes wave-bounce {
+  0%, 100% { transform: scaleY(0.3); }
+  50% { transform: scaleY(1.5); }
+}
+
+.sound-bar:nth-child(1) { animation: wave-bounce 0.8s infinite ease-in-out 0.1s; }
+.sound-bar:nth-child(2) { animation: wave-bounce 0.8s infinite ease-in-out 0.2s; }
+.sound-bar:nth-child(3) { animation: wave-bounce 0.8s infinite ease-in-out 0.3s; }
+.sound-bar:nth-child(4) { animation: wave-bounce 0.8s infinite ease-in-out 0.4s; }
+.sound-bar:nth-child(5) { animation: wave-bounce 0.8s infinite ease-in-out 0.5s; }
+.sound-bar:nth-child(6) { animation: wave-bounce 0.8s infinite ease-in-out 0.6s; }
