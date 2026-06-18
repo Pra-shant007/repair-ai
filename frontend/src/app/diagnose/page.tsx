@@ -95,7 +95,7 @@ function DiagnoseContent() {
     setIsCompleted(false);
 
     try {
-      const res = await fetch('http://localhost:5000/api/ai/detect', {
+      const res = await fetch('https://repair-ai.onrender.com/api/ai/detect', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -139,7 +139,7 @@ function DiagnoseContent() {
   // Start repair session on the backend
   const startServerRepairSession = async (token: string, diagId: string) => {
     try {
-      const res = await fetch('http://localhost:5000/api/repairs/start', {
+      const res = await fetch('https://repair-ai.onrender.com/api/repairs/start', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -321,7 +321,7 @@ function DiagnoseContent() {
     setVerificationLogs((prev) => [...prev, `🔍 [VISION] Analyzing frame for Step ${currentStepIdx}...`]);
 
     try {
-      const res = await fetch('http://localhost:5000/api/ai/verify', {
+      const res = await fetch('https://repair-ai.onrender.com/api/ai/verify', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -392,7 +392,7 @@ function DiagnoseContent() {
   // Update step progress on Express server
   const updateServerRepairStep = async (stepIdx: number, completed: boolean) => {
     try {
-      await fetch(`http://localhost:5000/api/repairs/${repairId}/step`, {
+      await fetch(`https://repair-ai.onrender.com/api/repairs/${repairId}/step`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -482,7 +482,7 @@ function DiagnoseContent() {
     // Save report link on server if authenticated
     if (authToken && diagnosticId) {
       try {
-        await fetch('http://localhost:5000/api/repairs/report', {
+        await fetch('https://repair-ai.onrender.com/api/repairs/report', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',

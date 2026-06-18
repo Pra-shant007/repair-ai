@@ -70,7 +70,7 @@ export default function Dashboard() {
 
   const fetchDashboardStats = async (authToken: string) => {
     try {
-      const res = await fetch('http://localhost:5000/api/repairs/stats', {
+      const res = await fetch('https://repair-ai.onrender.com/api/repairs/stats', {
         headers: {
           Authorization: `Bearer ${authToken}`
         }
@@ -140,7 +140,7 @@ export default function Dashboard() {
       : { email, password };
 
     try {
-      const res = await fetch(`http://localhost:5000/api/auth/${endpoint}`, {
+      const res = await fetch(`https://repair-ai.onrender.com/api/auth/${endpoint}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'

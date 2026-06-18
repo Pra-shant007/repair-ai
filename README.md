@@ -56,7 +56,7 @@ Start both the Express API backend and Next.js frontend concurrently in develope
 ```bash
 npm run dev
 ```
-- **Backend API**: `http://localhost:5000`
+- **Backend API**: `https://repair-ai.onrender.com`
 - **Frontend Client**: `http://localhost:3000`
 
 ---
