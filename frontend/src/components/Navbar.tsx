@@ -36,7 +36,7 @@ export default function Navbar() {
     { name: 'Live Repair', href: '/diagnose', icon: Wrench },
     { name: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
     { name: 'Knowledge Base', href: '/knowledge-base', icon: BookOpen },
-    { name: 'Expert Consult', href: '/consult', icon: Video },
+    { name: 'Expert Consult', href: '/dashboardVideo },
   ];
 
   return (
