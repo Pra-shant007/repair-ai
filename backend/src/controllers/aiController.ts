@@ -2,7 +2,14 @@ import { Response } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { isUsingMockDB, mockDB } from '../config/db';
 import Diagnostic from '../models/Diagnostic';
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import dotenv from "dotenv";
 
+dotenv.config();
+
+const genAI = new GoogleGenerativeAI(
+  process.env.GEMINI_API_KEY || ""
+);
 // Core Demo scenarios data used in both frontend and backend
 export const demoScenarios: Record<string, {
   deviceName: string;
@@ -236,36 +243,63 @@ export const verifyStep = async (req: AuthenticatedRequest, res: Response) => {
 
 // AI Persistent Chat Assistant
 export const queryAssistant = async (req: AuthenticatedRequest, res: Response) => {
-  const { message, scenarioId, history } = req.body;
+  try {
+    const { message, scenarioId } = req.body;
 
-  if (!message) {
-    return res.status(400).json({ message: 'Empty query message' });
+    if (!message) {
+      return res.status(400).json({
+        message: "Empty query message"
+      });
+    }
+
+    const scenario = scenarioId
+      ? demoScenarios[scenarioId]
+      : null;
+
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.0-flash"
+    });
+
+    const prompt = `
+You are RepairAI Copilot, an expert electronics repair assistant.
+
+Device:
+${scenario?.deviceName || "Unknown Device"}
+
+Device Type:
+${scenario?.deviceType || "Unknown"}
+
+Repair Context:
+${scenario?.chatContext || "General electronics repair"}
+
+User Question:
+${message}
+
+Instructions:
+- Give clear repair guidance.
+- Mention safety precautions when needed.
+- Mention tools required if relevant.
+- Be concise but helpful.
+- Use professional technician-style language.
+`;
+
+    const result = await model.generateContent(prompt);
+
+    const reply = result.response.text();
+
+    return res.status(200).json({
+      reply,
+      timestamp: new Date()
+    });
+
+  } catch (error: any) {
+    console.error("Gemini Error:", error);
+
+    return res.status(500).json({
+      reply: "Sorry, Gemini AI is currently unavailable.",
+      error: error.message,
+      timestamp: new Date()
+    });
   }
-
-  const cleanQuery = message.toLowerCase();
-
-  // If Gemini or OpenAI API keys exist, we could connect here.
-  // For standard deployment, we build an offline expert system mapping keywords to context.
-  let response = '';
-
-  const scenario = scenarioId ? demoScenarios[scenarioId] : null;
-
-  if (cleanQuery.includes('static') || cleanQuery.includes('safety') || cleanQuery.includes('shock')) {
-    response = '⚠️ SAFETY TIP: Static electricity can kill sensitive chipsets! Ground yourself by touching a metal object periodically, wear an anti-static wrist strap, and never touch gold contact pins directly with your fingers.';
-  } else if (cleanQuery.includes('tool') || cleanQuery.includes('screwdriver')) {
-    response = '🔧 TOOLS REQUIRED: For most laptops and phones, you need a Precision Screwdriver kit (Phillips #00, Torx T5, and Pentalobe for Mac/iPhone) alongside plastic spudgers and guitar picks to pry panels open safely.';
-  } else if (cleanQuery.includes('battery') || cleanQuery.includes('power')) {
-    response = '🔌 POWER WARNING: Never work on a device that is connected to a charger! Always disconnect the internal battery cable first. Even low voltage can damage components if a metal tool contacts the logic board.';
-  } else if (scenario && (cleanQuery.includes('current') || cleanQuery.includes('how') || cleanQuery.includes('what'))) {
-    // Return custom scenario helper advice
-    response = `📝 Copilot Tip for your ${scenario.deviceName}: ${scenario.chatContext}\n\nMake sure to follow the checklist. We are observing the feed to auto-verify each step.`;
-  } else {
-    // General helpful answer
-    response = "🤖 RepairAI Copilot: I am scanning your live camera feed. I can explain any step, suggest tools, or provide safety warnings. Just ask me questions like: 'How do I avoid static?', 'What tools do I need?', or 'Is this step safe?'.";
-  }
-
-  return res.status(200).json({
-    reply: response,
-    timestamp: new Date()
-  });
 };
+
