@@ -26,7 +26,7 @@ export const demoScenarios: Record<string, {
     deviceName: 'HP Pavilion 15',
     deviceType: 'Laptop',
     confidenceScore: 98.20,
-    difficultyScore: 25,
+    difficultyScore: 25, 
     estimatedCost: 85.00,
     successProbability: 98.00,
     components: [
@@ -225,7 +225,7 @@ export const verifyStep = async (req: AuthenticatedRequest, res: Response) => {
     feet_removed: 'AI verified rubber pads removed from bottom plastic socket holes.',
     housing_opened: 'AI observed router top shell removed. Wireless boards accessible.',
     antennas_checked: 'AI detected micro-coaxial (U.FL) connections visualised.',
-    leads_secured: 'AI verified coaxial feed snapped down. Resistance match detected.'
+    leads_secured: 'AI verified coaxial feed snapped down. Resistance match detected.' 
   };
 
   const trigger = currentStepData.verificationTrigger;
