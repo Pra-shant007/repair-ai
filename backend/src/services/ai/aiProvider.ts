@@ -1,4 +1,5 @@
 import { AnalyzeFrameInput, RawProviderDetection, RawStepVerification, VerifyStepInput } from '../../types/ai';
+import { ProposeHypothesesInput, RawDiagnosticReasoning } from '../../types/diagnostic';
 
 /**
  * The replaceability boundary for the AI perception layer.
@@ -31,4 +32,18 @@ export interface AiProvider {
    * services/repairStepService.ts, which is deterministic.
    */
   verifyStep(input: VerifyStepInput): Promise<RawStepVerification>;
+
+  /**
+   * Propose candidate fault hypotheses for a symptom (diagnostic reasoning).
+   *
+   * This is REASONING, not perception and not action selection. The provider
+   * may only classify into the fixed fault vocabulary handed to it in
+   * `input.candidateFaults`, may estimate a confidence, and may add factual
+   * observations — but it must NEVER choose a physical action, test, or repair
+   * step. Those are decided deterministically downstream by the test selector.
+   *
+   * Returns RAW, UNTRUSTED output for the normalizer to validate; a malformed
+   * response must not be assumed to be a valid DiagnosticReasoning.
+   */
+  proposeHypotheses(input: ProposeHypothesesInput): Promise<RawDiagnosticReasoning>;
 }

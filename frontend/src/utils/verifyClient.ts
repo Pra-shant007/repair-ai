@@ -212,7 +212,9 @@ export type VerificationErrorKind =
   | 'invalid_image' // HTTP 400
   | 'not_found' // HTTP 404
   | 'unavailable' // HTTP 5xx / Gemini down
-  | 'network'; // fetch threw / aborted / timed out
+  | 'network' // fetch threw / aborted / timed out
+  | 'camera_unavailable' // no live frame captured — we refuse to call the verifier
+  | 'persist_failed'; // COMPLETED verdict could not be saved to the server
 
 /**
  * Build a fail-safe view-model for an error. Every error holds the current step:
@@ -223,13 +225,20 @@ export const errorView = (kind: VerificationErrorKind, detail?: string): Verific
     invalid_image: 'The captured frame was rejected as invalid. Recapture and try again.',
     not_found: 'This scenario or step was not found on the server.',
     unavailable: 'The verification service is temporarily unavailable (the vision model may be down). Please try again.',
-    network: 'Could not reach the verification service. Check your connection and try again.'
+    network: 'Could not reach the verification service. Check your connection and try again.',
+    camera_unavailable:
+      'Camera frame unavailable — no live image was captured. Point the camera at the component and try again.',
+    persist_failed:
+      'Step verified, but saving progress to the server failed. Your progress was not recorded, so the step is still active.'
   };
   const guidance: Record<VerificationErrorKind, string | null> = {
     invalid_image: 'Make sure the component is well lit and centred, then capture again.',
     not_found: null,
     unavailable: null,
-    network: null
+    network: null,
+    camera_unavailable:
+      'Allow camera access and make sure the live feed is visible, then press Verify again.',
+    persist_failed: 'Check your connection and press Verify again to retry.'
   };
   return {
     status: 'ERROR',
@@ -245,4 +254,72 @@ export const errorView = (kind: VerificationErrorKind, detail?: string): Verific
     components: [],
     warnings: []
   };
+};
+
+/**
+ * Type guard: is this a real, capturable frame we can send to the verifier?
+ *
+ * `CameraFeedHandle.captureFrame()` returns a `data:image/...` data URL from a
+ * live <video>, or `null` when there is no live camera. We refuse to call the
+ * verifier without a genuine frame, so the backend's no-image (simulated) path
+ * is NEVER reachable from this UI. Older callers keep working server-side.
+ */
+export const canVerifyWithFrame = (frame: string | null): frame is string =>
+  typeof frame === 'string' && frame.startsWith('data:image');
+
+/**
+ * The only transitions the Next button may perform. The BACKEND decides where
+ * the repair goes; this never derives a destination (no `currentIndex + 1`).
+ *   finish  -> the backend reported the repair is complete
+ *   advance -> COMPLETED verdict AND the backend supplied a concrete nextStep
+ *   hold    -> anything else (not verified, or COMPLETED with no destination)
+ */
+export type NextTransition =
+  | { kind: 'finish' }
+  | { kind: 'advance'; toIndex: number }
+  | { kind: 'hold'; reason: string };
+
+export const nextTransition = (view: VerificationView | null): NextTransition => {
+  if (!view) return { kind: 'hold', reason: 'Verify the current step before advancing.' };
+  if (view.repairComplete) return { kind: 'finish' };
+  if (view.status === 'COMPLETED' && view.nextStep)
+    return { kind: 'advance', toIndex: view.nextStep.index };
+  if (view.status === 'COMPLETED')
+    return {
+      kind: 'hold',
+      reason: 'The server did not provide a next step, so the repair cannot advance.'
+    };
+  return { kind: 'hold', reason: 'This step is not verified yet — verify it before advancing.' };
+};
+
+/**
+ * The result of trying to persist a COMPLETED verdict to the server.
+ *   ok      -> PATCH succeeded (res.ok)
+ *   failed  -> PATCH was attempted but the server rejected/could not be reached
+ *   skipped -> no persistence was attempted (e.g. guest session, no repairId)
+ */
+export type PersistOutcome = 'ok' | 'failed' | 'skipped';
+
+export interface CompletionResult {
+  /** The view to render — swapped to a `persist_failed` error when saving failed. */
+  view: VerificationView;
+  /** Whether the current step may be marked complete in local UI state. */
+  markStepComplete: boolean;
+}
+
+/**
+ * Reconcile a verification verdict with the outcome of persisting it.
+ *
+ * A COMPLETED step may only be marked done locally once the server has recorded
+ * it. If persistence FAILED we surface a `persist_failed` error and keep the
+ * step active, so a save failure can never masquerade as progress. Non-COMPLETED
+ * verdicts never mark the step complete regardless of persistence.
+ */
+export const resolveCompletion = (
+  view: VerificationView,
+  persist: PersistOutcome
+): CompletionResult => {
+  if (view.status !== 'COMPLETED') return { view, markStepComplete: false };
+  if (persist === 'failed') return { view: errorView('persist_failed'), markStepComplete: false };
+  return { view, markStepComplete: true };
 };

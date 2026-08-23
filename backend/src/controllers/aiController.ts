@@ -14,6 +14,7 @@ import {
   verifyStepWithVision
 } from '../services/aiService';
 import { describeDecision, evaluateStepProgress } from '../services/repairStepService';
+import { resolveScenario } from '../services/scenarioResolver';
 import { DetectionResult, StepObservation } from '../types/ai';
 
 dotenv.config();
@@ -68,15 +69,25 @@ const persistScenarioDiagnostic = async (
   return newDiag;
 };
 
-// Component detection.
+// Component detection / device discovery.
 //
-// Two code paths, chosen by whether the request carried an image:
-//   - no image  -> the existing scenario-based detection, completely unchanged
-//   - image     -> real AI analysis through the provider-agnostic aiService
+// Three code paths, chosen by what the request actually carried:
+//   - no image + scenarioId -> the original scenario-based detection, unchanged
+//   - image  + scenarioId   -> scenario steps plus real AI detections
+//   - image  only           -> DEVICE DISCOVERY: identify the device, then let
+//                              scenarioResolver map that observation onto one of
+//                              the supported scenarios (or onto nothing)
+//
+// `scenarioId` is optional. The image-only path is the device-identification-
+// first entry point; the two scenarioId paths are untouched so existing callers
+// keep working.
+//
+// In every path the repair steps are copied verbatim out of demoScenarios. The
+// model identifies hardware; it never selects or authors a repair procedure.
 //
 // Every field the previous response returned is still returned with the same
 // meaning. The AI output arrives in additive fields (`device`,
-// `detectedComponents`, `source`, `warnings`, `aiPowered`).
+// `detectedComponents`, `source`, `warnings`, `aiPowered`, `scenario`).
 export const detectComponents = async (req: AuthenticatedRequest, res: Response) => {
   const { scenarioId, image, frameImage } = req.body;
 
@@ -112,7 +123,14 @@ export const detectComponents = async (req: AuthenticatedRequest, res: Response)
         device: detection.device,
         detectedComponents: detection.components,
         source: detection.source,
-        warnings: detection.warnings
+        warnings: detection.warnings,
+        // The scenario was chosen explicitly by the caller, not resolved from an
+        // image. Echoed here so every /detect response has the same shape.
+        scenario: {
+          id: scenarioId,
+          confidence: scenario.confidenceScore / 100,
+          reason: 'Scenario supplied explicitly by the client.'
+        }
       });
     } catch (error) {
       return res.status(500).json({ message: 'Component detection failed', error: (error as Error).message });
@@ -168,17 +186,69 @@ export const detectComponents = async (req: AuthenticatedRequest, res: Response)
         device: detection.device,
         detectedComponents: detection.components,
         source: detection.source,
-        warnings: allWarnings
+        warnings: allWarnings,
+        // Scenario was supplied by the caller; echoed for a uniform shape.
+        scenario: {
+          id: scenarioId,
+          confidence: knownScenario.confidenceScore / 100,
+          reason: 'Scenario supplied explicitly by the client.'
+        }
       });
     } catch (error) {
       return res.status(500).json({ message: 'Component detection failed', error: (error as Error).message });
     }
   }
 
-  // 2b. Image only, no supported scenario: report what the model actually saw.
-  // No repair procedure is generated, no scenario is invented, and nothing is
-  // persisted — Diagnostic requires scenario-derived scoring fields and those
-  // are never fabricated.
+  // 2b. Image only, no supported scenario supplied: DEVICE DISCOVERY.
+  //
+  // The device has already been identified by the vision layer above. Now the
+  // deterministic resolver maps that observation onto one of the supported
+  // repair scenarios. The resolver never calls a model and never authors steps;
+  // it only ever returns a demoScenarios key or null.
+  const match = resolveScenario(detection);
+
+  // 2b-i. A supported scenario matched. Return its steps verbatim from
+  // demoScenarios (never model-authored) and persist the scan, exactly like the
+  // explicit-scenario path — the only difference is that the id was resolved
+  // from the image instead of supplied by the caller.
+  if (match.scenarioId && demoScenarios[match.scenarioId]) {
+    const resolved = demoScenarios[match.scenarioId];
+    try {
+      const newDiag = await persistScenarioDiagnostic(req.user?.id, resolved);
+
+      return res.status(200).json({
+        diagnosticId: newDiag._id.toString(),
+        // Device fields reflect what the MODEL saw, not the canned scenario, so
+        // the UI can show the real identification. Steps/scoring come from the
+        // resolved scenario.
+        deviceName: detection.device?.model ?? detection.device?.type ?? resolved.deviceName,
+        deviceType: detection.device?.type ?? resolved.deviceType,
+        confidenceScore: detection.device ? toPercent(detection.device.confidence) : null,
+        components: resolved.components,
+        difficultyScore: resolved.difficultyScore,
+        estimatedCost: resolved.estimatedCost,
+        successProbability: resolved.successProbability,
+        steps: resolved.steps,
+        aiPowered: true,
+        device: detection.device,
+        detectedComponents: detection.components,
+        source: detection.source,
+        warnings: allWarnings,
+        scenario: {
+          id: match.scenarioId,
+          confidence: match.confidence,
+          reason: match.reason
+        }
+      });
+    } catch (error) {
+      return res.status(500).json({ message: 'Component detection failed', error: (error as Error).message });
+    }
+  }
+
+  // 2b-ii. A device may have been identified, but it maps to no supported
+  // scenario. Report what the model saw. No repair procedure is generated, no
+  // scenario is invented, and nothing is persisted — Diagnostic requires
+  // scenario-derived scoring fields and those are never fabricated.
   return res.status(200).json({
     diagnosticId: null,
     deviceName: detection.device?.model ?? detection.device?.type ?? null,
@@ -194,6 +264,8 @@ export const detectComponents = async (req: AuthenticatedRequest, res: Response)
     detectedComponents: detection.components,
     source: detection.source,
     warnings: allWarnings,
+    // Always null here, but the field is present so the client can rely on it.
+    scenario: null,
     message: detection.device
       ? 'Device identified from image. No supported repair scenario matches this detection yet.'
       : 'No device could be identified in the supplied image.'

@@ -20,6 +20,11 @@ import {
   RawStepVerification,
   VerifyStepInput
 } from '../../types/ai';
+import {
+  FAULT_LABELS,
+  ProposeHypothesesInput,
+  RawDiagnosticReasoning
+} from '../../types/diagnostic';
 import { AiProvider } from './aiProvider';
 
 /** Gemini returns box_2d as [ymin, xmin, ymax, xmax] scaled to this range. */
@@ -230,6 +235,85 @@ Rules:
 - Output raw JSON only, with no markdown fences and no commentary.`;
 };
 
+/**
+ * Prompt for diagnostic reasoning about a symptom.
+ *
+ * This prompt is deliberately CONSTRAINED. It asks only for a classification of
+ * possible faults into the fixed vocabulary supplied by the caller, plus short
+ * factual observations. It explicitly forbids the model from proposing any
+ * physical action, test, tool, disassembly, or repair procedure — that decision
+ * is made deterministically and safely by the test selector, never by the
+ * model. The symptom text is flattened first so a user cannot restructure the
+ * prompt via injection.
+ *
+ * Exported for unit tests: "the model may only use the allowed fault codes and
+ * is never asked what the user should physically do" is the architectural rule
+ * this prompt enforces, and it cannot be checked against the live API here.
+ */
+export const buildDiagnosticPrompt = (input: ProposeHypothesesInput): string => {
+  const symptom = promptSafe(input.symptom, 600) ?? '(no symptom description supplied)';
+
+  const deviceLine = input.device
+    ? `A camera identified the device as type "${input.device.type}"${
+        input.device.brand ? `, brand "${input.device.brand}"` : ''
+      }${input.device.model ? `, model "${input.device.model}"` : ''} (identification confidence ${input.device.confidence.toFixed(
+        2
+      )}). Treat this as context, not proof.`
+    : 'No device could be identified from an image. Reason from the symptom text alone and stay cautious.';
+
+  const observationLines =
+    input.observations.length > 0
+      ? input.observations
+          .map((o) => promptSafe(o, 200))
+          .filter((o): o is string => Boolean(o))
+          .map((o) => `- ${o}`)
+          .join('\n')
+      : '- (none recorded yet)';
+
+  const faultList = input.candidateFaults
+    .map((code) => `- "${code}": ${FAULT_LABELS[code] ?? code}`)
+    .join('\n');
+
+  return `You are the diagnostic-reasoning component of an electronics repair assistant.
+
+Your ONLY job is to propose which faults could explain the reported symptom. You are NOT choosing what the user should do, and a separate deterministic system decides every physical action.
+
+Reported symptom:
+${symptom}
+
+Device context:
+${deviceLine}
+
+Prior observations:
+${observationLines}
+
+You may ONLY classify faults using these exact codes:
+${faultList}
+
+Return ONLY a JSON object with this exact shape:
+{
+  "observations": ["<short factual interpretation of the symptom or device, no advice>"],
+  "hypotheses": [
+    {
+      "code": "<one of the allowed fault codes above, verbatim>",
+      "label": "<short human-readable label for the fault>",
+      "confidence": <number between 0 and 1>,
+      "rationale": "<one sentence: why this fault could explain the symptom>",
+      "supportedBy": ["<which symptom detail or observation supports this>"]
+    }
+  ]
+}
+
+Rules:
+- "code" MUST be exactly one of the allowed codes above. Never invent a new code or category.
+- Propose at most 5 hypotheses, most likely first. If several faults are plausible, list them; do not force a single answer.
+- "confidence" must reflect your real uncertainty. If the symptom is vague or no device was identified, keep confidence low.
+- If nothing in the list plausibly applies, return a single hypothesis with code "unknown".
+- Do NOT recommend any physical action, diagnostic test, tool, measurement, disassembly, power operation, or repair step of any kind. You classify faults only.
+- Do NOT invent device details, part numbers, or observations you cannot justify from the input.
+- Output raw JSON only, with no markdown fences and no commentary.`;
+};
+
 export class GeminiProvider implements AiProvider {
   public readonly name = 'gemini';
 
@@ -249,9 +333,14 @@ export class GeminiProvider implements AiProvider {
   }
 
   /**
-   * One request, one response, one JSON object. Shared by both provider
-   * methods so there is a single place where the model is called, errors are
-   * redacted, and latency is recorded.
+   * One request, one response, one JSON object. Shared by all provider methods
+   * so there is a single place where the model is called, errors are redacted,
+   * and latency is recorded.
+   *
+   * `image` is OPTIONAL: perception calls (analyzeFrame/verifyStep) send a
+   * frame, but diagnostic reasoning is text-only — no image is uploaded for it,
+   * which keeps perception and reasoning distinct and avoids a second image
+   * upload per interaction.
    *
    * `label` only ever identifies which operation ran — no prompt content, no
    * image data, and no credentials are logged.
@@ -259,24 +348,29 @@ export class GeminiProvider implements AiProvider {
   private async requestJson(
     label: string,
     prompt: string,
-    image: { data: string; mimeType: string }
+    image?: { data: string; mimeType: string } | null
   ): Promise<Record<string, unknown>> {
     const model = this.client.getGenerativeModel({
       model: this.modelName,
       generationConfig: {
-        // Low temperature: this is a perception task, not a creative one.
+        // Low temperature: this is a perception/classification task, not a
+        // creative one.
         temperature: 0.1,
         responseMimeType: 'application/json'
       }
     });
 
+    const parts: Array<{ text: string } | { inlineData: { data: string; mimeType: string } }> = [
+      { text: prompt }
+    ];
+    if (image) {
+      parts.push({ inlineData: { data: image.data, mimeType: image.mimeType } });
+    }
+
     const startedAt = Date.now();
     let text: string;
     try {
-      const result = await model.generateContent(
-        [{ text: prompt }, { inlineData: { data: image.data, mimeType: image.mimeType } }],
-        { timeout: this.timeoutMs }
-      );
+      const result = await model.generateContent(parts, { timeout: this.timeoutMs });
       text = result.response.text();
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -348,6 +442,24 @@ export class GeminiProvider implements AiProvider {
       observations: parsed.observations ?? parsed.notes,
       components: GeminiProvider.mapComponents(parsed.components ?? parsed.visibleComponents),
       warnings: parsed.warnings
+    };
+  }
+
+  /**
+   * Propose fault hypotheses for a symptom. Text-only: no image is uploaded
+   * here (perception already happened via analyzeFrame), so this is one cheap
+   * reasoning round-trip per session.
+   *
+   * Returns raw, untrusted output. In particular the fault codes are passed
+   * through as-is for the normalizer to validate against the allowed
+   * vocabulary — this method neither decides an action nor filters codes.
+   */
+  public async proposeHypotheses(input: ProposeHypothesesInput): Promise<RawDiagnosticReasoning> {
+    const parsed = await this.requestJson('proposeHypotheses', buildDiagnosticPrompt(input));
+
+    return {
+      observations: parsed.observations ?? parsed.notes,
+      hypotheses: parsed.hypotheses ?? parsed.faults
     };
   }
 }

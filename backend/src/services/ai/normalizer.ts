@@ -23,6 +23,14 @@ import {
   RawStepVerification,
   StepObservation
 } from '../../types/ai';
+import {
+  DiagnosticReasoning,
+  FAULT_CODES,
+  FAULT_LABELS,
+  FaultCode,
+  FaultHypothesis,
+  RawDiagnosticReasoning
+} from '../../types/diagnostic';
 
 /** Hard ceilings so a runaway model response cannot bloat a response payload. */
 const MAX_COMPONENTS = 40;
@@ -365,3 +373,123 @@ export const emptyStepObservation = (source: string, warnings: string[] = []): S
   source,
   warnings
 });
+
+/** Ceiling on hypotheses so a runaway reasoning response cannot bloat state. */
+const MAX_HYPOTHESES = 6;
+const MAX_RATIONALE_LENGTH = 240;
+const MAX_SUPPORTED_BY = 6;
+/** The valid fault vocabulary as a set, for O(1) membership checks. */
+const FAULT_CODE_SET = new Set<string>(FAULT_CODES);
+
+const readRationale = (value: unknown): string => {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  return trimmed.length > MAX_RATIONALE_LENGTH ? trimmed.slice(0, MAX_RATIONALE_LENGTH) : trimmed;
+};
+
+const readSupportedBy = (value: unknown): string[] => {
+  if (value === null || value === undefined) return [];
+  const entries = Array.isArray(value) ? value : [value];
+  const result: string[] = [];
+  for (const entry of entries) {
+    if (result.length >= MAX_SUPPORTED_BY) break;
+    const text = readText(entry);
+    if (text) result.push(text);
+  }
+  return result;
+};
+
+/**
+ * Validate an array of raw hypotheses.
+ *
+ * Conservative, exactly like the detection path: a hypothesis whose code is not
+ * in the fixed vocabulary is DROPPED (the model cannot invent a fault), and one
+ * with no usable confidence is DROPPED (belief is never invented). Duplicated
+ * codes collapse to the highest-confidence occurrence. Nothing here can create
+ * a hypothesis the model did not send.
+ */
+const normalizeHypotheses = (value: unknown, warnings: string[]): FaultHypothesis[] => {
+  if (value === null || value === undefined) return [];
+  if (!Array.isArray(value)) {
+    warnings.push('Hypotheses were ignored: expected an array.');
+    return [];
+  }
+
+  const byCode = new Map<FaultCode, FaultHypothesis>();
+  let dropped = 0;
+
+  for (const entry of value) {
+    if (!isRecord(entry)) {
+      dropped++;
+      continue;
+    }
+
+    const rawCode = readText(entry.code);
+    if (!rawCode || !FAULT_CODE_SET.has(rawCode)) {
+      dropped++;
+      continue;
+    }
+    const code = rawCode as FaultCode;
+
+    const confidence = readConfidence(entry.confidence);
+    if (confidence === null) {
+      dropped++;
+      continue;
+    }
+
+    const label = readText(entry.label) ?? FAULT_LABELS[code];
+    const hypothesis: FaultHypothesis = {
+      code,
+      label,
+      confidence: clamp01(confidence),
+      rationale: readRationale(entry.rationale),
+      supportedBy: readSupportedBy(entry.supportedBy)
+    };
+
+    const existing = byCode.get(code);
+    if (!existing || hypothesis.confidence > existing.confidence) {
+      byCode.set(code, hypothesis);
+    }
+  }
+
+  if (dropped > 0) {
+    warnings.push(
+      `${dropped} hypothesis${dropped === 1 ? '' : 'es'} dropped: unknown fault code, missing confidence, or malformed entry.`
+    );
+  }
+
+  const ranked = [...byCode.values()].sort((a, b) => b.confidence - a.confidence);
+  if (ranked.length > MAX_HYPOTHESES) {
+    warnings.push(`Only the top ${MAX_HYPOTHESES} hypotheses were kept.`);
+    return ranked.slice(0, MAX_HYPOTHESES);
+  }
+  return ranked;
+};
+
+/**
+ * Turn raw provider reasoning output into a validated DiagnosticReasoning.
+ *
+ * Never throws. An unusable response becomes an empty reasoning result plus
+ * warnings, which the diagnostic service reads as "no hypotheses" (leading to
+ * INSUFFICIENT_EVIDENCE rather than a fabricated diagnosis). The model can only
+ * ever contribute hypotheses in the fixed vocabulary and short factual
+ * observations; everything else is discarded here.
+ */
+export const normalizeDiagnosticReasoning = (
+  raw: RawDiagnosticReasoning,
+  source: string,
+  initialWarnings: string[] = []
+): DiagnosticReasoning => {
+  const warnings = [...initialWarnings];
+
+  if (!isRecord(raw)) {
+    warnings.push('AI reasoning response was not a usable object; no hypotheses were produced.');
+    return { hypotheses: [], observations: [], source, warnings };
+  }
+
+  const observations = normalizeObservations(raw.observations ?? raw.notes, warnings);
+  const hypotheses = normalizeHypotheses(raw.hypotheses ?? raw.faults, warnings);
+
+  return { hypotheses, observations, source, warnings };
+};

@@ -15,6 +15,7 @@ import {
   StepObservation,
   VerifyStepInput
 } from '../types/ai';
+import { DiagnosticReasoning, ProposeHypothesesInput } from '../types/diagnostic';
 import { AiProvider } from './ai/aiProvider';
 import { GeminiProvider } from './ai/geminiProvider';
 import { mockProvider, scenarioDetection } from './ai/mockProvider';
@@ -22,6 +23,7 @@ import {
   emptyDetection,
   emptyStepObservation,
   normalizeDetection,
+  normalizeDiagnosticReasoning,
   normalizeStepObservation
 } from './ai/normalizer';
 
@@ -300,4 +302,58 @@ export const verifyStepWithVision = async (
   );
 
   return { observation, timings: { providerMs, normalizeMs, totalMs } };
+};
+
+/**
+ * Diagnostic reasoning entry point — the single place a controller asks "what
+ * faults could explain this symptom?".
+ *
+ * Like analyzeFrame: never throws, one provider call per request (a client
+ * cannot multiply Gemini quota by looping), and it validates the untrusted
+ * output before returning. Reasoning is advisory — the deterministic selector,
+ * not this result, decides what the user is asked to do — so a Gemini failure
+ * falls back to the offline heuristic reasoner (clearly labelled `source:
+ * 'mock'` with a warning) rather than aborting the diagnostic loop. If the mock
+ * itself is the active provider, a failure just yields empty reasoning.
+ */
+export const reasonAboutFault = async (
+  input: ProposeHypothesesInput
+): Promise<DiagnosticReasoning> => {
+  const provider = getProvider();
+
+  try {
+    const raw = await provider.proposeHypotheses(input);
+    return normalizeDiagnosticReasoning(raw, provider.name);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`[aiService] ${provider.name} proposeHypotheses failed: ${detail}`);
+
+    if (provider.name === mockProvider.name) {
+      return {
+        hypotheses: [],
+        observations: [],
+        source: mockProvider.name,
+        warnings: ['AI reasoning failed; no hypotheses available.']
+      };
+    }
+
+    try {
+      const raw = await mockProvider.proposeHypotheses(input);
+      const fallback = normalizeDiagnosticReasoning(raw, mockProvider.name);
+      return {
+        ...fallback,
+        warnings: [
+          `${provider.name} reasoning failed; used offline heuristic reasoning instead.`,
+          ...fallback.warnings
+        ]
+      };
+    } catch {
+      return {
+        hypotheses: [],
+        observations: [],
+        source: provider.name,
+        warnings: ['AI reasoning failed; no hypotheses available.']
+      };
+    }
+  }
 };

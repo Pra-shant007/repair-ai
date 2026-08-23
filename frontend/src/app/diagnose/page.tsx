@@ -21,7 +21,13 @@ import {
   RefreshCw,
   Terminal,
   HelpCircle,
-  Award
+  Award,
+  Stethoscope,
+  Eye,
+  Brain,
+  ThumbsUp,
+  ThumbsDown,
+  Ban
 } from 'lucide-react';
 import { demoScenarios, IRepairStep } from '@/utils/repairGuides';
 import { downloadReport } from '@/utils/pdfGenerator';
@@ -30,9 +36,22 @@ import Chatbot from '@/components/Chatbot';
 import {
   interpretVerification,
   errorView,
+  canVerifyWithFrame,
+  nextTransition,
+  resolveCompletion,
   VerificationView,
   NormalizedComponent,
+  PersistOutcome,
 } from '@/utils/verifyClient';
+import {
+  interpretDiagnosis,
+  errorDiagnosisView,
+  errorKindForStatus,
+  canStartDiagnosis,
+  handoff,
+  DiagnosisView,
+  DiagnosticAnswer,
+} from '@/utils/diagnoseClient';
 
 // Single source for the backend origin. Override with NEXT_PUBLIC_API_BASE_URL
 // (e.g. http://localhost:5000) to point the UI at a local mock/Gemini backend
@@ -43,14 +62,37 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'https://repair-ai.onre
 // Gemini provider itself times out at 20s, so this leaves margin for overhead.
 const VERIFY_TIMEOUT_MS = 30000;
 
+// The manual "Override" button lets a user bypass visual verification and mark a
+// step complete by hand. It is OFF by default and only appears when explicitly
+// enabled via NEXT_PUBLIC_ENABLE_REPAIR_OVERRIDE=true. The real demo must rely on
+// AI verification, not a bypass, so this stays false unless deliberately set.
+const REPAIR_OVERRIDE_ENABLED = process.env.NEXT_PUBLIC_ENABLE_REPAIR_OVERRIDE === 'true';
+
 function DiagnoseContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
 
-  // Selected scenario ID (from URL parameter or default to RAM Upgrade)
-  const initialScenario = searchParams.get('scenario') || 'laptop_ram_upgrade';
-  const [scenarioId, setScenarioId] = useState(
-    demoScenarios[initialScenario] ? initialScenario : 'laptop_ram_upgrade'
+  // DEVICE-IDENTIFICATION-FIRST vs explicit selection.
+  //
+  // A valid `?scenario=<id>` means the caller already chose a repair (e.g. a
+  // "Start this repair" link from the knowledge base, or the in-page "Active
+  // Guide" selector). No param means DISCOVERY-FIRST: the scenario is unknown
+  // until the camera identifies the device and the backend resolver maps it.
+  const requestedScenario = searchParams.get('scenario');
+  const explicitScenarioId =
+    requestedScenario && demoScenarios[requestedScenario] ? requestedScenario : null;
+
+  // While discovering, scenarioId holds a harmless placeholder so
+  // demoScenarios[scenarioId] is always defined; the repair UI stays hidden
+  // (phase !== 'repair') so the placeholder is never shown as a real match.
+  const [scenarioId, setScenarioId] = useState(explicitScenarioId ?? 'laptop_ram_upgrade');
+
+  // 'discovery' identifies the device first; 'repair' means a scenario is locked
+  // in (either resolved from the image, or supplied explicitly via the URL).
+  // 'diagnostic' is the symptom-driven copilot loop that can run BEFORE a repair
+  // and, when it lands on a grounded procedure, hands off into 'repair'.
+  const [phase, setPhase] = useState<'discovery' | 'diagnostic' | 'repair'>(
+    explicitScenarioId ? 'repair' : 'discovery'
   );
 
   const activeScenario = demoScenarios[scenarioId];
@@ -75,6 +117,33 @@ function DiagnoseContent() {
   // Real AI-detected components (normalized 0..1) for the live camera overlay.
   const [detectedComponents, setDetectedComponents] = useState<NormalizedComponent[]>([]);
 
+  // ---- Device-discovery (image-first) readout ----
+  // True while a single discovery frame is in flight.
+  const [isDiscovering, setIsDiscovering] = useState(false);
+  // What the vision layer actually identified in the last scan (independent of
+  // whether it resolved to a supported scenario).
+  const [discoveredDevice, setDiscoveredDevice] = useState<{
+    name: string;
+    type: string | null;
+    confidencePercent: number | null;
+  } | null>(null);
+  // Set when a device was identified but maps to no supported scenario, when no
+  // device could be identified, or when the scan itself failed. Shown in-panel.
+  const [discoveryNotice, setDiscoveryNotice] = useState<string | null>(null);
+
+  // ---- Diagnostic copilot (symptom-driven) ----
+  // What the user typed into "What problem are you experiencing?".
+  const [symptomText, setSymptomText] = useState('');
+  // Latest interpreted diagnosis session, rendered as the four panels.
+  const [diagnosis, setDiagnosis] = useState<DiagnosisView | null>(null);
+  // Single busy flag for the whole diagnostic channel. Every diagnostic request
+  // checks it first, so a double tap / impatient retry can never put two AI
+  // requests in flight for the same session.
+  const [isDiagnosing, setIsDiagnosing] = useState(false);
+  // Ref mirror of the busy flag: state updates are async, so two clicks in the
+  // same tick would both see `isDiagnosing === false`. The ref closes that gap.
+  const diagnoseBusyRef = useRef(false);
+
   // Hands-free voice assistant configurations
   const [isVoiceActive, setIsVoiceActive] = useState(false);
   const [isMicActive, setIsMicActive] = useState(false);
@@ -83,6 +152,9 @@ function DiagnoseContent() {
 
   // Fluctuating confidence score simulation
   useEffect(() => {
+    // Only meaningful once a scenario is locked in. During discovery the readout
+    // shows the live device-identification confidence instead of a scenario's.
+    if (phase !== 'repair') return;
     if (isCompleted) {
       setAiConfidence(100);
       return;
@@ -98,25 +170,54 @@ function DiagnoseContent() {
     }, 1500);
 
     return () => clearInterval(interval);
-  }, [scenarioId, isCompleted]);
+  }, [scenarioId, isCompleted, phase]);
 
   // Track if user is authenticated
   const [authToken, setAuthToken] = useState<string | null>(null);
+  // Guards the one-time auto-start for the explicit ?scenario= path so it never
+  // re-fires and opens a second repair session.
+  const explicitStartedRef = useRef(false);
+
   useEffect(() => {
     const token = localStorage.getItem('token');
     setAuthToken(token);
-    triggerDeviceDetection(token);
-  }, [scenarioId]);
 
-  // 1. Device Identification & Detection Trigger
-  const triggerDeviceDetection = async (token: string | null) => {
-    setVerificationLogs([`⚡ [SYSTEM] Launching Vision AI for ${activeScenario.deviceName}...`]);
+    // Explicit scenario supplied in the URL -> preserve the original behavior:
+    // run the scenario-first detection and (if signed in) open a repair session
+    // immediately. DISCOVERY-FIRST (no explicit scenario) instead waits for the
+    // user to scan a device — nothing is started until a scenario is resolved.
+    if (explicitScenarioId && !explicitStartedRef.current) {
+      explicitStartedRef.current = true;
+      startRepairForScenario(explicitScenarioId, token);
+    }
+    // Runs once on mount; explicitScenarioId is derived from the initial URL.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Start (or restart) a repair for an EXPLICITLY chosen scenario: the URL
+  // ?scenario= param or the in-page "Active Guide" selector. This is the
+  // scenario-FIRST path and its behavior is unchanged from before — it runs the
+  // canned scenario detection to obtain a diagnosticId and opens a server repair
+  // session. (runDeviceDiscovery below is the image-first alternative.)
+  //
+  // Parameterized by an explicit id (rather than reading the scenarioId state)
+  // so a caller that has just changed the selection is not affected by the
+  // async state update.
+  const startRepairForScenario = async (scId: string, token: string | null) => {
+    const scenario = demoScenarios[scId];
+    if (!scenario) return;
+
+    setScenarioId(scId);
+    setPhase('repair');
+    setDiscoveredDevice(null);
+    setDiscoveryNotice(null);
     setCurrentStepIdx(1);
     setCompletedSteps({});
     setSafetyChecked(false);
     setIsCompleted(false);
     setVerification(null);
     setDetectedComponents([]);
+    setVerificationLogs([`⚡ [SYSTEM] Launching Vision AI for ${scenario.deviceName}...`]);
 
     try {
       const res = await fetch(`${API_BASE}/api/ai/detect`, {
@@ -125,7 +226,7 @@ function DiagnoseContent() {
           'Content-Type': 'application/json',
           Authorization: token ? `Bearer ${token}` : '',
         },
-        body: JSON.stringify({ scenarioId }),
+        body: JSON.stringify({ scenarioId: scId }),
       });
 
       if (res.ok) {
@@ -135,12 +236,12 @@ function DiagnoseContent() {
           ...prev,
           `✅ [VISION] Device Identified: ${data.deviceName} (${data.deviceType})`,
           `🔎 [VISION] Detected ${data.components.length} micro-components on layout canvas.`,
-          `📢 [COPILOT] Step 1 Loaded: "${activeScenario.steps[0].stepTitle}"`,
+          `📢 [COPILOT] Step 1 Loaded: "${scenario.steps[0].stepTitle}"`,
         ]);
 
         // Start repair session on server if authenticated
         if (token) {
-          startServerRepairSession(token, data.diagnosticId);
+          startServerRepairSession(scId, token, data.diagnosticId);
         }
       } else {
         throw new Error('API server unavailable');
@@ -152,16 +253,155 @@ function DiagnoseContent() {
       setTimeout(() => {
         setVerificationLogs((prev) => [
           ...prev,
-          `✅ [VISION] Device Identified: ${activeScenario.deviceName} (${activeScenario.deviceType})`,
-          `🔎 [VISION] Components mapped: ${activeScenario.components.map((c) => c.name).join(', ')}`,
-          `📢 [COPILOT] Step 1 Loaded: "${activeScenario.steps[0].stepTitle}"`,
+          `✅ [VISION] Device Identified: ${scenario.deviceName} (${scenario.deviceType})`,
+          `🔎 [VISION] Components mapped: ${scenario.components.map((c) => c.name).join(', ')}`,
+          `📢 [COPILOT] Step 1 Loaded: "${scenario.steps[0].stepTitle}"`,
         ]);
       }, 500);
     }
   };
 
-  // Start repair session on the backend
-  const startServerRepairSession = async (token: string, diagId: string) => {
+  // DEVICE-IDENTIFICATION-FIRST discovery (image-first).
+  //
+  // Captures exactly ONE frame, asks the backend to identify the device, and
+  // lets the server-side resolver map that observation onto a supported repair
+  // scenario. The scenario is NOT assumed here and the repair session is NOT
+  // started until resolution actually succeeds. Steps always come from the
+  // backend (which copies them verbatim from demoScenarios); the frontend never
+  // authors or picks a procedure.
+  const runDeviceDiscovery = async () => {
+    if (isDiscovering) return;
+
+    // Exactly like verification: with no live frame we must NOT fall through to
+    // the backend's no-image path. Tell the user and stop — no request is sent.
+    const frame = cameraRef.current?.captureFrame() ?? null;
+    if (!canVerifyWithFrame(frame)) {
+      setDiscoveryNotice(
+        'No live camera frame available. Allow camera access, point it at the device, then scan again.'
+      );
+      setVerificationLogs((prev) => [
+        ...prev,
+        '🚫 [VISION] No live camera frame. Point the camera at the device and scan again.',
+      ]);
+      return;
+    }
+
+    setIsDiscovering(true);
+    setDiscoveryNotice(null);
+    setDiscoveredDevice(null);
+    setDetectedComponents([]);
+    setVerificationLogs(['⚡ [SYSTEM] Scanning frame to identify device...']);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/ai/detect`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: authToken ? `Bearer ${authToken}` : '',
+        },
+        // Image ONLY, no scenarioId: this is the discovery entry point.
+        body: JSON.stringify({ image: frame }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+
+      // Draw whatever the model actually saw, regardless of resolution outcome.
+      setDetectedComponents(
+        Array.isArray(data.detectedComponents) ? data.detectedComponents : []
+      );
+
+      const resolvedId: string | null =
+        data.scenario && data.scenario.id && demoScenarios[data.scenario.id]
+          ? (data.scenario.id as string)
+          : null;
+
+      if (resolvedId) {
+        // A supported scenario was resolved from the image. Lock it in.
+        const resolvedScenario = demoScenarios[resolvedId];
+
+        setDiscoveredDevice({
+          name: data.deviceName ?? resolvedScenario.deviceName,
+          type: data.deviceType ?? resolvedScenario.deviceType,
+          confidencePercent:
+            typeof data.confidenceScore === 'number' ? Math.round(data.confidenceScore) : null,
+        });
+
+        setVerificationLogs((prev) => [
+          ...prev,
+          `✅ [VISION] Device Identified: ${data.deviceName ?? 'device'} (${
+            data.deviceType ?? 'unknown type'
+          })`,
+          `🔎 [VISION] ${data.detectedComponents?.length ?? 0} component(s) detected.`,
+          `🧭 [RESOLVER] Matched supported scenario: ${resolvedScenario.deviceName} — ${data.scenario.reason}`,
+          `📢 [COPILOT] Step 1 Loaded: "${resolvedScenario.steps[0].stepTitle}"`,
+        ]);
+
+        // Reset repair state for the resolved scenario, then enter repair phase.
+        setDiagnosticId(data.diagnosticId ?? null);
+        setScenarioId(resolvedId);
+        setCurrentStepIdx(1);
+        setCompletedSteps({});
+        setSafetyChecked(false);
+        setIsCompleted(false);
+        setVerification(null);
+        setPhase('repair');
+
+        // Open a server-side repair session using the RESOLVED id and the
+        // diagnostic the discovery call already persisted. No second detect.
+        if (authToken && data.diagnosticId) {
+          startServerRepairSession(resolvedId, authToken, data.diagnosticId);
+        }
+      } else if (data.device) {
+        // A device was identified, but it maps to no supported procedure.
+        setDiscoveredDevice({
+          name: data.deviceName ?? 'Unrecognized device',
+          type: data.deviceType ?? null,
+          confidencePercent:
+            typeof data.confidenceScore === 'number' ? Math.round(data.confidenceScore) : null,
+        });
+        setDiscoveryNotice('Device detected, but no supported repair procedure is available.');
+        setVerificationLogs((prev) => [
+          ...prev,
+          `✅ [VISION] Device Identified: ${data.deviceName ?? 'device'} (${
+            data.deviceType ?? 'unknown type'
+          })`,
+          '⛔ [RESOLVER] No supported repair procedure matches this device.',
+        ]);
+      } else {
+        // Nothing identifiable in the frame.
+        setDiscoveredDevice(null);
+        setDiscoveryNotice(
+          'No device could be identified. Move closer, improve lighting, and scan again.'
+        );
+        setVerificationLogs((prev) => [
+          ...prev,
+          '⛔ [VISION] No device could be identified in the frame.',
+        ]);
+      }
+    } catch (e) {
+      setDiscoveryNotice(
+        'Device identification is unavailable right now. Check your connection and scan again.'
+      );
+      setVerificationLogs((prev) => [
+        ...prev,
+        `⚠️ [ERROR] Device identification failed: ${
+          e instanceof Error ? e.message : 'unknown error'
+        }.`,
+      ]);
+    } finally {
+      setIsDiscovering(false);
+    }
+  };
+
+  // Start repair session on the backend. Parameterized by an explicit scenario
+  // id so both entry paths (explicit selection and resolved discovery) share it.
+  const startServerRepairSession = async (scId: string, token: string, diagId: string) => {
+    const scenario = demoScenarios[scId];
+    if (!scenario) return;
     try {
       const res = await fetch(`${API_BASE}/api/repairs/start`, {
         method: 'POST',
@@ -171,10 +411,10 @@ function DiagnoseContent() {
         },
         body: JSON.stringify({
           diagnosticId: diagId,
-          scenarioId: scenarioId,
-          deviceName: activeScenario.deviceName,
-          deviceType: activeScenario.deviceType,
-          steps: activeScenario.steps,
+          scenarioId: scId,
+          deviceName: scenario.deviceName,
+          deviceType: scenario.deviceType,
+          steps: scenario.steps,
         }),
       });
 
@@ -185,6 +425,202 @@ function DiagnoseContent() {
     } catch (e) {
       console.error('Failed to start repair tracking:', e);
     }
+  };
+
+  // ------------------------------------------------------------------
+  // DIAGNOSTIC COPILOT
+  //
+  // Symptom-driven loop that runs BEFORE any repair: the user describes what is
+  // wrong, the backend perceives the device, proposes fault hypotheses, and picks
+  // the single safest next check. The frontend NEVER decides what the user should
+  // physically do — it renders `nextBestAction` verbatim and posts the answer
+  // back. When the backend confirms a fault that has a grounded procedure, the
+  // user is handed to the EXISTING repair flow; no second repair flow exists.
+  //
+  // Camera policy: the preview stays live continuously, but frames are only sent
+  // on an explicit user action (starting a diagnosis). Answering a check costs no
+  // AI call at all — the backend updates hypotheses deterministically.
+  // ------------------------------------------------------------------
+
+  /** POST JSON to the diagnostic API with a timeout. Returns the parsed body. */
+  const postDiagnostic = async (
+    path: string,
+    body: Record<string, unknown>
+  ): Promise<{ ok: boolean; status: number; data: any }> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), VERIFY_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${API_BASE}${path}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: authToken ? `Bearer ${authToken}` : '',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      const data = await res.json().catch(() => null);
+      return { ok: res.ok, status: res.status, data };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  /** Append the copilot's reasoning to the shared log console. */
+  const logDiagnosis = (view: DiagnosisView) => {
+    const lines: string[] = [];
+    if (view.deviceLabel) lines.push(`✅ [VISION] Device: ${view.deviceLabel}`);
+    if (view.think.length > 0) {
+      lines.push(
+        `🧠 [REASONING] ${view.think
+          .slice(0, 3)
+          .map((h) => `${h.label} ${h.confidencePercent}%`)
+          .join(' · ')}`
+      );
+    }
+    if (view.action) {
+      lines.push(`🧭 [SELECTOR] Next check (${view.action.riskLevel}): ${view.action.title}`);
+    }
+    if (view.confirmed) lines.push(`🎯 [DIAGNOSIS] ${view.message}`);
+    if (view.status === 'UNSAFE_TO_GUIDE') {
+      lines.push('⛔ [SAFETY] Remaining checks are gated. Not auto-offering an unsafe action.');
+    }
+    if (view.status === 'ERROR') lines.push(`⚠️ [ERROR] ${view.message}`);
+    for (const w of view.warnings) lines.push(`⚠️ [MODEL] ${w}`);
+    if (lines.length > 0) setVerificationLogs((prev) => [...prev, ...lines]);
+  };
+
+  /**
+   * Start a diagnosis: at most ONE perception call plus ONE reasoning call on the
+   * server. Sends a live frame only when a real one exists — never a placeholder.
+   */
+  const runDiagnosis = async () => {
+    if (diagnoseBusyRef.current) return;
+
+    const frame = cameraRef.current?.captureFrame() ?? null;
+    if (!canStartDiagnosis(symptomText, frame)) {
+      setDiagnosis(errorDiagnosisView('camera_unavailable'));
+      setVerificationLogs((prev) => [
+        ...prev,
+        '🚫 [COPILOT] Nothing to diagnose: no live frame and no description.',
+      ]);
+      return;
+    }
+
+    diagnoseBusyRef.current = true;
+    setIsDiagnosing(true);
+    setDiagnosis(null);
+    setDiscoveryNotice(null);
+    setPhase('diagnostic');
+    setVerificationLogs(['⚡ [COPILOT] Starting diagnosis from your description…']);
+
+    try {
+      const { ok, status, data } = await postDiagnostic('/api/ai/diagnose', {
+        // Image only when it is a genuine live capture.
+        ...(canVerifyWithFrame(frame) ? { image: frame } : {}),
+        userDescription: symptomText,
+        sessionId: null,
+      });
+
+      const view = ok
+        ? interpretDiagnosis(data ?? {})
+        : errorDiagnosisView(errorKindForStatus(status), data?.message);
+      setDiagnosis(view);
+      logDiagnosis(view);
+    } catch (e) {
+      const view = errorDiagnosisView('network', e instanceof Error ? e.message : undefined);
+      setDiagnosis(view);
+      logDiagnosis(view);
+    } finally {
+      diagnoseBusyRef.current = false;
+      setIsDiagnosing(false);
+    }
+  };
+
+  /**
+   * Report the outcome of the pending check. Costs ZERO AI calls: the backend
+   * updates hypotheses from its own hand-written interpretation of the answer.
+   */
+  const answerDiagnosticCheck = async (answer: DiagnosticAnswer) => {
+    if (diagnoseBusyRef.current) return;
+
+    const sessionId = diagnosis?.sessionId;
+    const action = diagnosis?.action;
+    if (!sessionId || !action || !action.answerable || !action.testId) return;
+
+    diagnoseBusyRef.current = true;
+    setIsDiagnosing(true);
+    setVerificationLogs((prev) => [
+      ...prev,
+      `🙋 [USER] ${action.title} → ${answer === 'unclear' ? 'not sure' : answer}`,
+    ]);
+
+    try {
+      const { ok, status, data } = await postDiagnostic(
+        `/api/ai/diagnose/${encodeURIComponent(sessionId)}/result`,
+        { answer, testId: action.testId }
+      );
+
+      const view = ok
+        ? interpretDiagnosis(data ?? {})
+        : errorDiagnosisView(errorKindForStatus(status), data?.message);
+      setDiagnosis(view);
+      logDiagnosis(view);
+    } catch (e) {
+      const view = errorDiagnosisView('network', e instanceof Error ? e.message : undefined);
+      setDiagnosis(view);
+      logDiagnosis(view);
+    } finally {
+      diagnoseBusyRef.current = false;
+      setIsDiagnosing(false);
+    }
+  };
+
+  // The diagnosis session a grounded repair was started from, so the link can be
+  // recorded once the repair session id comes back from the server.
+  const linkedDiagnosisRef = useRef<string | null>(null);
+
+  /**
+   * Hand off to the EXISTING repair flow. Only reachable when the backend both
+   * confirmed a fault and published a grounded procedure for it, so an arbitrary
+   * unsupported device can never open a step-by-step repair.
+   */
+  const startGroundedRepair = () => {
+    const decision = handoff(diagnosis);
+    if (decision.kind !== 'repair') return;
+    if (!demoScenarios[decision.scenarioId]) {
+      // The server named a procedure this build does not ship. Stay advisory.
+      setDiscoveryNotice(
+        'The recommended procedure is not available in this build, so I can only advise.'
+      );
+      return;
+    }
+    linkedDiagnosisRef.current = diagnosis?.sessionId ?? null;
+    // Existing entry point — same code path as the ?scenario= link and the
+    // in-page guide selector. Nothing about the repair flow is duplicated here.
+    startRepairForScenario(decision.scenarioId, authToken);
+  };
+
+  // Record diagnosis -> repair on the server once the repair session exists.
+  // Best-effort and non-blocking: the repair works whether or not this lands.
+  useEffect(() => {
+    const diagSessionId = linkedDiagnosisRef.current;
+    if (!repairId || !diagSessionId) return;
+    linkedDiagnosisRef.current = null;
+    postDiagnostic(`/api/ai/diagnose/${encodeURIComponent(diagSessionId)}/repair`, {
+      repairId,
+    }).catch(() => {
+      /* the link is bookkeeping only */
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repairId]);
+
+  /** Abandon the current diagnosis and go back to the scan/describe screen. */
+  const resetDiagnosis = () => {
+    if (diagnoseBusyRef.current) return;
+    setDiagnosis(null);
+    setPhase('discovery');
+    setVerificationLogs([]);
   };
 
   // 2. Text-to-Speech (TTS) Voice Synthesis
@@ -337,50 +773,70 @@ function DiagnoseContent() {
   // Apply a verification verdict to the UI. This is the ONLY place a step is
   // marked complete, and it is gated strictly on an explicit COMPLETED verdict —
   // a successful request with any other status never advances the repair.
-  const applyVerification = (view: VerificationView) => {
-    setVerification(view);
-    // Reflect the latest detections on the overlay (empty array clears stale boxes).
-    setDetectedComponents(view.components);
-
-    const scoreLabel = view.confidencePercent != null ? `${view.confidencePercent}%` : 'n/a';
+  //
+  // For a COMPLETED verdict the current step is persisted to the server BEFORE
+  // it is presented as done. Persistence is awaited; if it fails we swap in a
+  // persist_failed error, keep the step active, and never mark it complete — a
+  // save failure can never masquerade as progress.
+  const applyVerification = async (view: VerificationView) => {
+    let resolved = view;
+    let markComplete = false;
 
     if (view.status === 'COMPLETED') {
+      let persist: PersistOutcome = 'skipped';
+      if (authToken && repairId) {
+        const saved = await updateServerRepairStep(currentStepIdx, true);
+        persist = saved ? 'ok' : 'failed';
+      }
+      const outcome = resolveCompletion(view, persist);
+      resolved = outcome.view;
+      markComplete = outcome.markStepComplete;
+    }
+
+    setVerification(resolved);
+    // Reflect the latest detections on the overlay (empty array clears stale boxes).
+    setDetectedComponents(resolved.components);
+
+    const scoreLabel =
+      resolved.confidencePercent != null ? `${resolved.confidencePercent}%` : 'n/a';
+
+    if (markComplete) {
+      // COMPLETED and persisted to the server (or persistence skipped for a
+      // guest session with no repairId).
       setVerificationLogs((prev) => [
         ...prev,
         `🤖 [AI AGENT] Confidence: ${scoreLabel}`,
-        `✅ [VERIFIED] ${view.message}`,
-        ...(view.nextStep ? [`📢 [COPILOT] Next step ready: "${view.nextStep.title}"`] : []),
-        ...(view.repairComplete ? ['🏆 [SYSTEM] Final step verified — repair complete.'] : []),
+        `✅ [VERIFIED] ${resolved.message}`,
+        ...(resolved.nextStep ? [`📢 [COPILOT] Next step ready: "${resolved.nextStep.title}"`] : []),
+        ...(resolved.repairComplete ? ['🏆 [SYSTEM] Final step verified — repair complete.'] : []),
       ]);
       // Mark ONLY the current step complete. The actual advance to nextStep is
       // driven by the backend's nextStep in handleNextStep, never by a blind +1.
       setCompletedSteps((prev) => ({ ...prev, [currentStepIdx]: true }));
-      if (authToken && repairId) {
-        updateServerRepairStep(currentStepIdx, true);
-      }
       speakText(
-        view.repairComplete
+        resolved.repairComplete
           ? 'Final step verified. Repair complete.'
           : 'Step verified. You may proceed to the next step.',
       );
-    } else if (view.status === 'NOT_COMPLETED') {
+    } else if (resolved.status === 'NOT_COMPLETED') {
       setVerificationLogs((prev) => [
         ...prev,
         `🤖 [AI AGENT] Confidence: ${scoreLabel}`,
-        `❌ [PENDING] ${view.message}`,
+        `❌ [PENDING] ${resolved.message}`,
       ]);
       speakText('This step does not look complete yet. Keep going, then verify again.');
-    } else if (view.status === 'UNCERTAIN') {
+    } else if (resolved.status === 'UNCERTAIN') {
       setVerificationLogs((prev) => [
         ...prev,
         `🤖 [AI AGENT] Confidence: ${scoreLabel}`,
-        `❓ [UNCERTAIN] ${view.message}`,
-        ...(view.guidance ? [`🎥 [GUIDANCE] ${view.guidance}`] : []),
+        `❓ [UNCERTAIN] ${resolved.message}`,
+        ...(resolved.guidance ? [`🎥 [GUIDANCE] ${resolved.guidance}`] : []),
       ]);
       speakText('Not enough visual evidence. Reposition the camera and verify again.');
     } else {
-      // ERROR — hold position and surface the problem.
-      setVerificationLogs((prev) => [...prev, `⚠️ [ERROR] ${view.message}`]);
+      // ERROR — hold position and surface the problem. This includes the
+      // persist_failed error swapped in above when saving progress failed.
+      setVerificationLogs((prev) => [...prev, `⚠️ [ERROR] ${resolved.message}`]);
       speakText('Verification could not be completed. Please try again.');
     }
   };
@@ -395,17 +851,25 @@ function DiagnoseContent() {
     }
     if (isVerifying) return;
 
-    setIsVerifying(true);
-
-    // Capture exactly one frame from the live camera. In simulation mode (no
-    // webcam) this is null, and we let the backend's no-image path respond
-    // rather than fabricating an image.
+    // Capture exactly one frame from the live camera. If there is NO live frame
+    // we must not fall back to the backend's no-image (simulated) path: stop
+    // here, surface a hard "camera frame unavailable" error, and leave the step
+    // unchanged and incomplete. The backend's no-image behavior is preserved
+    // server-side for older callers, but this UI never reaches it.
     const frame = cameraRef.current?.captureFrame() ?? null;
+    if (!canVerifyWithFrame(frame)) {
+      setVerificationLogs((prev) => [
+        ...prev,
+        `🚫 [VISION] No live camera frame for Step ${currentStepIdx}. Verification aborted — camera frame unavailable.`,
+      ]);
+      await applyVerification(errorView('camera_unavailable'));
+      return;
+    }
+
+    setIsVerifying(true);
     setVerificationLogs((prev) => [
       ...prev,
-      frame
-        ? `🔍 [VISION] Captured live frame for Step ${currentStepIdx}. Sending to verifier...`
-        : `🔍 [VISION] No live webcam frame; requesting simulated verification for Step ${currentStepIdx}...`,
+      `🔍 [VISION] Captured live frame for Step ${currentStepIdx}. Sending to verifier...`,
     ]);
 
     const controller = new AbortController();
@@ -422,7 +886,7 @@ function DiagnoseContent() {
         body: JSON.stringify({
           scenarioId,
           stepIndex: currentStepIdx,
-          ...(frame ? { frameImage: frame } : {}),
+          frameImage: frame,
         }),
         signal: controller.signal,
       });
@@ -448,13 +912,15 @@ function DiagnoseContent() {
       setIsVerifying(false);
     }
 
-    applyVerification(view);
+    await applyVerification(view);
   };
 
-  // Update step progress on Express server
-  const updateServerRepairStep = async (stepIdx: number, completed: boolean) => {
+  // Persist step progress on the Express server. Returns true only when the
+  // server acknowledged the write (res.ok); false on any HTTP error or network
+  // failure, so callers can react to a failed save instead of assuming success.
+  const updateServerRepairStep = async (stepIdx: number, completed: boolean): Promise<boolean> => {
     try {
-      await fetch(`${API_BASE}/api/repairs/${repairId}/step`, {
+      const res = await fetch(`${API_BASE}/api/repairs/${repairId}/step`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -465,8 +931,10 @@ function DiagnoseContent() {
           isCompleted: completed,
         }),
       });
+      return res.ok;
     } catch (e) {
       console.error('Failed to sync step completion:', e);
+      return false;
     }
   };
 
@@ -477,9 +945,13 @@ function DiagnoseContent() {
       return;
     }
 
-    // Prefer the backend's authoritative verdict/nextStep over any hardcoded
-    // "+1" transition. The frontend never invents where the repair goes next.
-    if (verification?.repairComplete) {
+    // The BACKEND is the single source of truth for progression. nextTransition
+    // only ever tells us to finish, advance to a backend-supplied nextStep, or
+    // hold. There is NO local "currentStepIdx + 1" guess — the frontend never
+    // invents where the repair goes next.
+    const transition = nextTransition(verification);
+
+    if (transition.kind === 'finish') {
       setIsCompleted(true);
       setVerification(null);
       setDetectedComponents([]);
@@ -491,39 +963,25 @@ function DiagnoseContent() {
       return;
     }
 
-    if (verification?.nextStep) {
-      const next = verification.nextStep;
-      setCurrentStepIdx(next.index);
+    if (transition.kind === 'advance') {
+      const next = verification?.nextStep;
+      setCurrentStepIdx(transition.toIndex);
       setSafetyChecked(false);
       setVerification(null);
       setDetectedComponents([]);
       setVerificationLogs((prev) => [
         ...prev,
-        `📢 [COPILOT] Loaded Step ${next.index}: "${next.title}"`,
+        next
+          ? `📢 [COPILOT] Loaded Step ${next.index}: "${next.title}"`
+          : `📢 [COPILOT] Loaded Step ${transition.toIndex}.`,
       ]);
       return;
     }
 
-    // Fallback (offline / manual override with no backend nextStep): keep the
-    // existing sequential progression through the local scenario.
-    if (currentStepIdx < activeScenario.steps.length) {
-      setCurrentStepIdx((prev) => prev + 1);
-      setSafetyChecked(false);
-      setVerification(null);
-      setDetectedComponents([]);
-      setVerificationLogs((prev) => [
-        ...prev,
-        `📢 [COPILOT] Loaded Step ${currentStepIdx + 1}: "${activeScenario.steps[currentStepIdx].stepTitle}"`,
-      ]);
-    } else {
-      // Final step reached
-      setIsCompleted(true);
-      setVerificationLogs((prev) => [
-        ...prev,
-        `🏆 [SYSTEM] All steps processed. Device repair checklist completed!`,
-      ]);
-      speakText('Congratulations! Repair guide completed. Preparing final report.');
-    }
+    // hold — the step is not verified, or the backend returned COMPLETED with no
+    // next step. Do nothing to the repair position; tell the user why.
+    setVerificationLogs((prev) => [...prev, `⛔ [BLOCKED] ${transition.reason}`]);
+    speakText(transition.reason);
   };
 
   const handlePrevStep = () => {
@@ -602,9 +1060,16 @@ function DiagnoseContent() {
 
   const handleScenarioChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const newId = e.target.value;
-    setScenarioId(newId);
+    // Picking from the guide selector is an EXPLICIT choice, so it jumps
+    // straight into that repair (scenario-first), bypassing discovery.
     router.push(`/diagnose?scenario=${newId}`);
+    startRepairForScenario(newId, authToken);
   };
+
+  // Where the current diagnosis is allowed to go next. Computed once per render:
+  // `repair` appears ONLY when the server confirmed a fault and published a
+  // grounded procedure for it.
+  const diagnosisHandoff = handoff(diagnosis);
 
   return (
     <div className="flex flex-col gap-6 md:gap-8 animate-in fade-in duration-200">
@@ -639,9 +1104,439 @@ function DiagnoseContent() {
         </div>
       </div>
 
+      {/* DEVICE-IDENTIFICATION-FIRST discovery view. Rendered until a supported
+          scenario is resolved from the camera (or one was supplied explicitly
+          via ?scenario=). The repair UI below only mounts once phase==='repair'. */}
+      {phase === 'discovery' && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          {/* LEFT: live camera to aim at the device being identified */}
+          <div className="lg:col-span-7 flex flex-col gap-4">
+            <CameraFeed
+              ref={cameraRef}
+              scenarioId={scenarioId}
+              components={[]}
+              activeComponentNames={[]}
+              detectedComponents={detectedComponents}
+            />
+
+            {/* Discovery logs console — shares styling with the repair view */}
+            <div className="glass-panel rounded-xl border border-white/5 overflow-hidden">
+              <div className="px-4 py-2 border-b border-white/5 bg-white/5 flex items-center justify-between">
+                <span className="text-[10px] text-gray-400 font-mono font-bold flex items-center gap-1">
+                  <Terminal className="w-3.5 h-3.5 text-primary" /> DEVICE DISCOVERY LOGS
+                </span>
+                <span className="text-[9px] text-gray-500 font-mono">Single-frame scan</span>
+              </div>
+              <div className="p-4 bg-black/60 font-mono text-[11px] text-gray-300 h-36 overflow-y-auto flex flex-col gap-1 select-text scrollbar-thin scrollbar-thumb-white/10">
+                {verificationLogs.length === 0 ? (
+                  <div className="text-gray-600">Awaiting first scan…</div>
+                ) : (
+                  verificationLogs.map((log, index) => (
+                    <div key={index} className="leading-relaxed whitespace-pre-wrap">{log}</div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* RIGHT: identify-device call to action + readout */}
+          <div className="lg:col-span-5 flex flex-col gap-6">
+            <div className="glass-panel rounded-2xl border border-white/10 overflow-hidden shadow-xl">
+              <div className="p-4 border-b border-white/5 bg-white/5 flex items-center gap-2">
+                <Cpu className="w-4 h-4 text-primary" />
+                <span className="text-xs font-bold text-gray-300 uppercase tracking-wider font-mono">
+                  Step 1 — Identify Device
+                </span>
+              </div>
+
+              <div className="p-6 flex flex-col gap-5">
+                <p className="text-sm text-gray-400 leading-relaxed">
+                  Point the camera at the device you want to repair, then scan. The AI identifies the
+                  device and its visible components, and we match it to a supported repair procedure
+                  before any steps begin.
+                </p>
+
+                <button
+                  onClick={runDeviceDiscovery}
+                  disabled={isDiscovering}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-bold text-black bg-primary hover:bg-primary/95 disabled:opacity-40 transition-all cursor-pointer shadow-lg shadow-primary/10"
+                >
+                  {isDiscovering ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" /> Identifying device…
+                    </>
+                  ) : (
+                    <>
+                      <Cpu className="w-4 h-4" /> Scan &amp; Identify Device
+                    </>
+                  )}
+                </button>
+
+                {/* What the vision layer identified in the last scan */}
+                {discoveredDevice && (
+                  <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 flex flex-col gap-3">
+                    <div className="flex items-center gap-2 text-xs font-bold text-primary">
+                      <Sparkles className="w-4 h-4" /> Device Identified
+                    </div>
+                    <div className="grid grid-cols-2 gap-3 font-mono text-[11px]">
+                      <div className="flex flex-col">
+                        <span className="text-gray-500 uppercase tracking-wider">Device</span>
+                        <span className="text-white font-semibold mt-0.5">{discoveredDevice.name}</span>
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-gray-500 uppercase tracking-wider">Type</span>
+                        <span className="text-white font-semibold mt-0.5">{discoveredDevice.type ?? '—'}</span>
+                      </div>
+                      {discoveredDevice.confidencePercent != null && (
+                        <div className="flex flex-col">
+                          <span className="text-gray-500 uppercase tracking-wider">Confidence</span>
+                          <span className="text-primary font-bold mt-0.5">{discoveredDevice.confidencePercent}%</span>
+                        </div>
+                      )}
+                      <div className="flex flex-col">
+                        <span className="text-gray-500 uppercase tracking-wider">Components</span>
+                        <span className="text-white font-semibold mt-0.5">{detectedComponents.length} detected</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* No supported match, no device, or scan error */}
+                {discoveryNotice && (
+                  <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4 flex items-start gap-2.5">
+                    <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <p className="text-xs text-gray-300 leading-relaxed">{discoveryNotice}</p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* SYMPTOM-DRIVEN ENTRY. The alternative to picking a procedure: say
+                what is wrong and let the copilot work out the cause. Works for
+                devices that have no repair guide — diagnosis is generic, while
+                step-by-step repair stays gated behind a grounded procedure. */}
+            <div className="glass-panel rounded-2xl border border-white/10 overflow-hidden shadow-xl">
+              <div className="p-4 border-b border-white/5 bg-white/5 flex items-center gap-2">
+                <Stethoscope className="w-4 h-4 text-primary" />
+                <span className="text-xs font-bold text-gray-300 uppercase tracking-wider font-mono">
+                  Or — Diagnose a Problem
+                </span>
+              </div>
+
+              <div className="p-6 flex flex-col gap-4">
+                <label
+                  htmlFor="symptom"
+                  className="text-sm font-semibold text-gray-200 leading-relaxed"
+                >
+                  What problem are you experiencing?
+                </label>
+                <textarea
+                  id="symptom"
+                  value={symptomText}
+                  onChange={(e) => setSymptomText(e.target.value)}
+                  rows={3}
+                  maxLength={600}
+                  placeholder="e.g. My laptop turns on but the screen stays black."
+                  className="w-full rounded-xl bg-black/40 border border-white/10 focus:border-primary/50 focus:outline-none p-3 text-sm text-gray-200 placeholder:text-gray-600 resize-none"
+                />
+                <p className="text-[11px] text-gray-500 leading-relaxed">
+                  I&apos;ll look at the device through the camera, work out the likely causes, and ask
+                  you to run the safest check first. I only start a guided repair if a verified
+                  procedure exists for your device.
+                </p>
+
+                <button
+                  onClick={runDiagnosis}
+                  disabled={isDiagnosing || symptomText.trim().length === 0}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-bold text-black bg-primary hover:bg-primary/95 disabled:opacity-40 transition-all cursor-pointer shadow-lg shadow-primary/10"
+                >
+                  {isDiagnosing ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" /> Diagnosing…
+                    </>
+                  ) : (
+                    <>
+                      <Stethoscope className="w-4 h-4" /> Diagnose the Problem
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DIAGNOSTIC COPILOT view. The camera preview stays live on the left; the
+          right column is the copilot's reasoning, rendered verbatim from the
+          server: what I see / what I think / what I need you to do / why. */}
+      {phase === 'diagnostic' && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          {/* LEFT: live camera (preview only — frames are sent on demand) */}
+          <div className="lg:col-span-7 flex flex-col gap-4">
+            <CameraFeed
+              ref={cameraRef}
+              scenarioId={scenarioId}
+              components={[]}
+              activeComponentNames={[]}
+              detectedComponents={detectedComponents}
+            />
+
+            <div className="glass-panel rounded-xl border border-white/5 overflow-hidden">
+              <div className="px-4 py-2 border-b border-white/5 bg-white/5 flex items-center justify-between">
+                <span className="text-[10px] text-gray-400 font-mono font-bold flex items-center gap-1">
+                  <Terminal className="w-3.5 h-3.5 text-primary" /> DIAGNOSTIC REASONING LOGS
+                </span>
+                <span className="text-[9px] text-gray-500 font-mono">Event-driven inference</span>
+              </div>
+              <div className="p-4 bg-black/60 font-mono text-[11px] text-gray-300 h-36 overflow-y-auto flex flex-col gap-1 select-text scrollbar-thin scrollbar-thumb-white/10">
+                {verificationLogs.length === 0 ? (
+                  <div className="text-gray-600">Awaiting diagnosis…</div>
+                ) : (
+                  verificationLogs.map((log, index) => (
+                    <div key={index} className="leading-relaxed whitespace-pre-wrap">{log}</div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* RIGHT: the copilot panel */}
+          <div className="lg:col-span-5 flex flex-col gap-6">
+            <div className="glass-panel rounded-2xl border border-white/10 overflow-hidden shadow-xl">
+              <div className="p-4 border-b border-white/5 bg-white/5 flex items-center justify-between gap-2">
+                <span className="text-xs font-bold text-gray-300 uppercase tracking-wider font-mono flex items-center gap-2">
+                  <Stethoscope className="w-4 h-4 text-primary" /> Diagnostic Copilot
+                </span>
+                <button
+                  onClick={resetDiagnosis}
+                  disabled={isDiagnosing}
+                  className="text-[10px] font-mono text-gray-400 hover:text-white disabled:opacity-40 flex items-center gap-1 cursor-pointer"
+                >
+                  <ArrowLeft className="w-3 h-3" /> START OVER
+                </button>
+              </div>
+
+              {isDiagnosing && !diagnosis && (
+                <div className="p-6 flex items-center gap-3 text-sm text-gray-400">
+                  <RefreshCw className="w-4 h-4 animate-spin text-primary" />
+                  Looking at the device and working out the likely causes…
+                </div>
+              )}
+
+              {diagnosis && (
+                <div className="p-6 flex flex-col gap-5">
+                  {/* Headline */}
+                  <div
+                    className={`rounded-xl border p-4 ${
+                      diagnosis.status === 'ERROR' || diagnosis.status === 'UNSAFE_TO_GUIDE'
+                        ? 'border-amber-500/30 bg-amber-500/5'
+                        : diagnosis.confirmed
+                          ? 'border-primary/30 bg-primary/5'
+                          : 'border-white/10 bg-white/5'
+                    }`}
+                  >
+                    <p className="text-sm text-gray-200 leading-relaxed">{diagnosis.message}</p>
+                    {diagnosis.deviceLabel && (
+                      <p className="text-[11px] font-mono text-gray-500 mt-2">
+                        DEVICE: <span className="text-gray-300">{diagnosis.deviceLabel}</span>
+                      </p>
+                    )}
+                  </div>
+
+                  {/* 1. WHAT I SEE */}
+                  {diagnosis.see.length > 0 && (
+                    <div className="flex flex-col gap-2">
+                      <span className="text-[10px] font-mono font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+                        <Eye className="w-3.5 h-3.5 text-primary" /> What I see
+                      </span>
+                      <ul className="flex flex-col gap-1.5">
+                        {diagnosis.see.map((line, i) => (
+                          <li key={i} className="text-xs text-gray-300 leading-relaxed flex gap-2">
+                            <span className="text-primary/60 shrink-0">•</span>
+                            <span>{line}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* 2. WHAT I THINK */}
+                  {diagnosis.think.length > 0 && (
+                    <div className="flex flex-col gap-2">
+                      <span className="text-[10px] font-mono font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+                        <Brain className="w-3.5 h-3.5 text-primary" /> What I think
+                      </span>
+                      <div className="flex flex-col gap-2">
+                        {diagnosis.think.map((h) => (
+                          <div key={h.code} className="flex flex-col gap-1">
+                            <div className="flex items-center justify-between gap-3">
+                              <span className="text-xs text-gray-200 font-semibold">{h.label}</span>
+                              <span className="text-[11px] font-mono text-primary font-bold shrink-0">
+                                {h.confidencePercent}%
+                              </span>
+                            </div>
+                            <div className="h-1 w-full rounded-full bg-white/5 overflow-hidden">
+                              <div
+                                className="h-full rounded-full bg-primary/70"
+                                style={{ width: `${h.confidencePercent}%` }}
+                              />
+                            </div>
+                            {h.rationale && (
+                              <p className="text-[11px] text-gray-500 leading-relaxed">{h.rationale}</p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 3. WHAT I NEED YOU TO DO */}
+                  {diagnosis.action && (
+                    <div className="flex flex-col gap-2.5 rounded-xl border border-primary/20 bg-primary/5 p-4">
+                      <span className="text-[10px] font-mono font-bold text-primary uppercase tracking-wider flex items-center gap-1.5">
+                        <Wrench className="w-3.5 h-3.5" /> What I need you to do
+                      </span>
+                      <p className="text-sm font-semibold text-white leading-snug">
+                        {diagnosis.action.title}
+                      </p>
+                      {diagnosis.action.instruction && (
+                        <p className="text-xs text-gray-300 leading-relaxed">
+                          {diagnosis.action.instruction}
+                        </p>
+                      )}
+                      <div className="flex items-center gap-3 text-[10px] font-mono text-gray-500">
+                        <span
+                          className={
+                            diagnosis.action.riskLevel === 'safe'
+                              ? 'text-emerald-400'
+                              : diagnosis.action.riskLevel === 'medium'
+                                ? 'text-amber-400'
+                                : 'text-red-400'
+                          }
+                        >
+                          RISK: {diagnosis.action.riskLevel.toUpperCase()}
+                        </span>
+                        <span>
+                          OBSERVE: {diagnosis.action.observe === 'camera' ? 'CAMERA' : 'YOU REPORT'}
+                        </span>
+                      </div>
+
+                      {diagnosis.action.answerable && (
+                        <>
+                          {diagnosis.action.question && (
+                            <p className="text-xs font-semibold text-gray-200 leading-relaxed mt-1">
+                              {diagnosis.action.question}
+                            </p>
+                          )}
+                          <div className="grid grid-cols-3 gap-2 mt-1">
+                            <button
+                              onClick={() => answerDiagnosticCheck('yes')}
+                              disabled={isDiagnosing}
+                              className="flex items-center justify-center gap-1.5 px-2 py-2.5 rounded-lg text-xs font-bold text-black bg-primary hover:bg-primary/95 disabled:opacity-40 transition-all cursor-pointer"
+                            >
+                              <ThumbsUp className="w-3.5 h-3.5" /> Yes
+                            </button>
+                            <button
+                              onClick={() => answerDiagnosticCheck('no')}
+                              disabled={isDiagnosing}
+                              className="flex items-center justify-center gap-1.5 px-2 py-2.5 rounded-lg text-xs font-bold text-gray-200 bg-white/10 hover:bg-white/15 disabled:opacity-40 transition-all cursor-pointer"
+                            >
+                              <ThumbsDown className="w-3.5 h-3.5" /> No
+                            </button>
+                            <button
+                              onClick={() => answerDiagnosticCheck('unclear')}
+                              disabled={isDiagnosing}
+                              className="flex items-center justify-center gap-1.5 px-2 py-2.5 rounded-lg text-xs font-bold text-gray-300 bg-white/5 hover:bg-white/10 disabled:opacity-40 transition-all cursor-pointer"
+                            >
+                              <HelpCircle className="w-3.5 h-3.5" /> Not sure
+                            </button>
+                          </div>
+                        </>
+                      )}
+
+                      {/* Non-answerable actions: re-scan or add detail, then retry. */}
+                      {!diagnosis.action.answerable && (
+                        <button
+                          onClick={runDiagnosis}
+                          disabled={isDiagnosing}
+                          className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-bold text-black bg-primary hover:bg-primary/95 disabled:opacity-40 transition-all cursor-pointer mt-1"
+                        >
+                          {isDiagnosing ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin" /> Working…
+                            </>
+                          ) : (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5" /> Scan again
+                            </>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* 4. WHY */}
+                  {diagnosis.why && (
+                    <div className="flex flex-col gap-1.5">
+                      <span className="text-[10px] font-mono font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+                        <HelpCircle className="w-3.5 h-3.5 text-primary" /> Why
+                      </span>
+                      <p className="text-xs text-gray-400 leading-relaxed">{diagnosis.why}</p>
+                    </div>
+                  )}
+
+                  {/* Advice — generic and non-procedural, safe for any device. */}
+                  {diagnosis.advice.length > 0 && (
+                    <div className="flex flex-col gap-2 rounded-xl border border-white/10 bg-white/5 p-4">
+                      <span className="text-[10px] font-mono font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-primary" /> Recommendation
+                      </span>
+                      <ul className="flex flex-col gap-1.5">
+                        {diagnosis.advice.map((line, i) => (
+                          <li key={i} className="text-xs text-gray-300 leading-relaxed flex gap-2">
+                            <span className="text-primary/60 shrink-0">•</span>
+                            <span>{line}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* HAND-OFF. Only rendered when the server confirmed a fault AND
+                      published a grounded procedure. Starts the EXISTING repair
+                      flow with its existing camera step verification. */}
+                  {diagnosisHandoff.kind === 'repair' && (
+                    <button
+                      onClick={startGroundedRepair}
+                      disabled={isDiagnosing}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-bold text-black bg-primary hover:bg-primary/95 disabled:opacity-40 transition-all cursor-pointer shadow-lg shadow-primary/10"
+                    >
+                      <Wrench className="w-4 h-4" /> Start the Guided Repair
+                      <ArrowRight className="w-4 h-4" />
+                    </button>
+                  )}
+
+                  {/* No grounded procedure: say so plainly instead of improvising
+                      physical steps for a device we have not verified. */}
+                  {diagnosisHandoff.kind === 'advice' && (
+                    <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4 flex items-start gap-2.5">
+                      <Ban className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                      <p className="text-xs text-gray-300 leading-relaxed">
+                        {diagnosisHandoff.reason}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Main Grid: Left HUD & Camera, Right steps panel, Rightmost chat sidebar */}
+      {phase === 'repair' && (
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        
+
         {/* LEFT COLUMN: Camera & HUD (Col span 7) */}
         <div className="lg:col-span-7 flex flex-col gap-4">
           <CameraFeed
@@ -914,15 +1809,20 @@ function DiagnoseContent() {
                         </>
                       )}
                     </button>
-                    
-                    <button
-                      onClick={handleManualComplete}
-                      disabled={isVerifying || riskLocked}
-                      className="px-3 py-2.5 rounded-xl text-xs font-semibold text-white bg-white/5 border border-white/10 hover:bg-white/10 disabled:opacity-40 transition-all cursor-pointer"
-                      title="Skip verification and mark completed"
-                    >
-                      Override
-                    </button>
+
+                    {/* Manual override: bypasses visual verification. Hidden by
+                        default; only rendered when NEXT_PUBLIC_ENABLE_REPAIR_OVERRIDE
+                        === 'true'. The real demo relies on AI verification. */}
+                    {REPAIR_OVERRIDE_ENABLED && (
+                      <button
+                        onClick={handleManualComplete}
+                        disabled={isVerifying || riskLocked}
+                        className="px-3 py-2.5 rounded-xl text-xs font-semibold text-white bg-white/5 border border-white/10 hover:bg-white/10 disabled:opacity-40 transition-all cursor-pointer"
+                        title="Skip verification and mark completed"
+                      >
+                        Override
+                      </button>
+                    )}
                   </div>
 
                   {/* Navigation steps */}
@@ -991,6 +1891,7 @@ function DiagnoseContent() {
           </div>
         </div>
       </div>
+      )}
 
       {/* Persistent Floating Chat Drawer on bottom/side (Expandable or layout inline) */}
       <div className="mt-8">
