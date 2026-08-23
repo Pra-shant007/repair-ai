@@ -25,8 +25,23 @@ import {
 } from 'lucide-react';
 import { demoScenarios, IRepairStep } from '@/utils/repairGuides';
 import { downloadReport } from '@/utils/pdfGenerator';
-import CameraFeed from '@/components/CameraFeed';
+import CameraFeed, { CameraFeedHandle } from '@/components/CameraFeed';
 import Chatbot from '@/components/Chatbot';
+import {
+  interpretVerification,
+  errorView,
+  VerificationView,
+  NormalizedComponent,
+} from '@/utils/verifyClient';
+
+// Single source for the backend origin. Override with NEXT_PUBLIC_API_BASE_URL
+// (e.g. http://localhost:5000) to point the UI at a local mock/Gemini backend
+// for testing; defaults to the deployed instance.
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'https://repair-ai.onrender.com';
+
+// How long to wait on a single verification round-trip before giving up. The
+// Gemini provider itself times out at 20s, so this leaves margin for overhead.
+const VERIFY_TIMEOUT_MS = 30000;
 
 function DiagnoseContent() {
   const searchParams = useSearchParams();
@@ -52,6 +67,13 @@ function DiagnoseContent() {
   // Real-time confidence scores and statistics
   const [aiConfidence, setAiConfidence] = useState(0);
   const [isCompleted, setIsCompleted] = useState(false);
+
+  // Imperative handle to the camera, used to grab ONE frame per verify action.
+  const cameraRef = useRef<CameraFeedHandle | null>(null);
+  // Latest interpreted /api/ai/verify result, rendered in the result panel.
+  const [verification, setVerification] = useState<VerificationView | null>(null);
+  // Real AI-detected components (normalized 0..1) for the live camera overlay.
+  const [detectedComponents, setDetectedComponents] = useState<NormalizedComponent[]>([]);
 
   // Hands-free voice assistant configurations
   const [isVoiceActive, setIsVoiceActive] = useState(false);
@@ -93,9 +115,11 @@ function DiagnoseContent() {
     setCompletedSteps({});
     setSafetyChecked(false);
     setIsCompleted(false);
+    setVerification(null);
+    setDetectedComponents([]);
 
     try {
-      const res = await fetch('https://repair-ai.onrender.com/api/ai/detect', {
+      const res = await fetch(`${API_BASE}/api/ai/detect`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -139,7 +163,7 @@ function DiagnoseContent() {
   // Start repair session on the backend
   const startServerRepairSession = async (token: string, diagId: string) => {
     try {
-      const res = await fetch('https://repair-ai.onrender.com/api/repairs/start', {
+      const res = await fetch(`${API_BASE}/api/repairs/start`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -310,18 +334,86 @@ function DiagnoseContent() {
 
   const activeComponentNames = getActiveComponents();
 
-  // 4. Live Verification Step Handler
+  // Apply a verification verdict to the UI. This is the ONLY place a step is
+  // marked complete, and it is gated strictly on an explicit COMPLETED verdict —
+  // a successful request with any other status never advances the repair.
+  const applyVerification = (view: VerificationView) => {
+    setVerification(view);
+    // Reflect the latest detections on the overlay (empty array clears stale boxes).
+    setDetectedComponents(view.components);
+
+    const scoreLabel = view.confidencePercent != null ? `${view.confidencePercent}%` : 'n/a';
+
+    if (view.status === 'COMPLETED') {
+      setVerificationLogs((prev) => [
+        ...prev,
+        `🤖 [AI AGENT] Confidence: ${scoreLabel}`,
+        `✅ [VERIFIED] ${view.message}`,
+        ...(view.nextStep ? [`📢 [COPILOT] Next step ready: "${view.nextStep.title}"`] : []),
+        ...(view.repairComplete ? ['🏆 [SYSTEM] Final step verified — repair complete.'] : []),
+      ]);
+      // Mark ONLY the current step complete. The actual advance to nextStep is
+      // driven by the backend's nextStep in handleNextStep, never by a blind +1.
+      setCompletedSteps((prev) => ({ ...prev, [currentStepIdx]: true }));
+      if (authToken && repairId) {
+        updateServerRepairStep(currentStepIdx, true);
+      }
+      speakText(
+        view.repairComplete
+          ? 'Final step verified. Repair complete.'
+          : 'Step verified. You may proceed to the next step.',
+      );
+    } else if (view.status === 'NOT_COMPLETED') {
+      setVerificationLogs((prev) => [
+        ...prev,
+        `🤖 [AI AGENT] Confidence: ${scoreLabel}`,
+        `❌ [PENDING] ${view.message}`,
+      ]);
+      speakText('This step does not look complete yet. Keep going, then verify again.');
+    } else if (view.status === 'UNCERTAIN') {
+      setVerificationLogs((prev) => [
+        ...prev,
+        `🤖 [AI AGENT] Confidence: ${scoreLabel}`,
+        `❓ [UNCERTAIN] ${view.message}`,
+        ...(view.guidance ? [`🎥 [GUIDANCE] ${view.guidance}`] : []),
+      ]);
+      speakText('Not enough visual evidence. Reposition the camera and verify again.');
+    } else {
+      // ERROR — hold position and surface the problem.
+      setVerificationLogs((prev) => [...prev, `⚠️ [ERROR] ${view.message}`]);
+      speakText('Verification could not be completed. Please try again.');
+    }
+  };
+
+  // 4. Live Verification Step Handler — captures ONE frame on demand and asks the
+  //    backend whether the CURRENT step is complete. No streaming, no per-frame
+  //    polling: one user action → one capture → one request → one verdict.
   const handleVerifyStep = async () => {
     if (riskLocked) {
       speakText('Please acknowledge safety precautions before verifying.');
       return;
     }
+    if (isVerifying) return;
 
     setIsVerifying(true);
-    setVerificationLogs((prev) => [...prev, `🔍 [VISION] Analyzing frame for Step ${currentStepIdx}...`]);
 
+    // Capture exactly one frame from the live camera. In simulation mode (no
+    // webcam) this is null, and we let the backend's no-image path respond
+    // rather than fabricating an image.
+    const frame = cameraRef.current?.captureFrame() ?? null;
+    setVerificationLogs((prev) => [
+      ...prev,
+      frame
+        ? `🔍 [VISION] Captured live frame for Step ${currentStepIdx}. Sending to verifier...`
+        : `🔍 [VISION] No live webcam frame; requesting simulated verification for Step ${currentStepIdx}...`,
+    ]);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), VERIFY_TIMEOUT_MS);
+
+    let view: VerificationView;
     try {
-      const res = await fetch('https://repair-ai.onrender.com/api/ai/verify', {
+      const res = await fetch(`${API_BASE}/api/ai/verify`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -330,69 +422,39 @@ function DiagnoseContent() {
         body: JSON.stringify({
           scenarioId,
           stepIndex: currentStepIdx,
-          frameImage: 'data:image/png;base64,iVBORw0KGgo...', // Simulated frame image
+          ...(frame ? { frameImage: frame } : {}),
         }),
+        signal: controller.signal,
       });
 
       if (res.ok) {
         const data = await res.json();
-        
-        // Log result
-        setVerificationLogs((prev) => [
-          ...prev,
-          `🤖 [AI AGENT] Match Score: ${data.confidence}%`,
-          data.verified 
-            ? `✅ [VERIFIED] ${data.message}`
-            : `❌ [PENDING] ${data.message}`,
-        ]);
-
-        if (data.verified) {
-          setCompletedSteps((prev) => ({ ...prev, [currentStepIdx]: true }));
-          speakText('Verification successful! You may proceed.');
-
-          // Update backend repair tracking step status
-          if (authToken && repairId) {
-            updateServerRepairStep(currentStepIdx, true);
-          }
-        } else {
-          speakText('Verification pending. Please ensure the component is visible.');
-        }
+        view = interpretVerification(data);
+      } else if (res.status === 400) {
+        view = errorView('invalid_image');
+      } else if (res.status === 404) {
+        view = errorView('not_found');
       } else {
-        throw new Error('API server failure');
+        // 5xx, auth, or anything else unexpected: hold position and report it.
+        view = errorView('unavailable', `HTTP ${res.status}`);
       }
-    } catch (e) {
-      console.warn('Backend offline. Simulating step verification success.');
-      // Simulated response when offline
-      setTimeout(() => {
-        const success = Math.random() > 0.15; // 85% success simulation
-        const fakeConf = (88 + Math.random() * 11).toFixed(2);
-        
-        if (success) {
-          setCompletedSteps((prev) => ({ ...prev, [currentStepIdx]: true }));
-          setVerificationLogs((prev) => [
-            ...prev,
-            `🤖 [AI AGENT] Match Score: ${fakeConf}%`,
-            `✅ [VERIFIED] Step completed. Machine vision confirms structural match for ${activeStep.verificationTrigger}.`,
-          ]);
-          speakText('Step verified successfully.');
-        } else {
-          setVerificationLogs((prev) => [
-            ...prev,
-            `🤖 [AI AGENT] Match Score: ${fakeConf}%`,
-            `❌ [PENDING] Visual parameters incomplete. Align camera directly to ${activeComponentNames.join(', ')}.`,
-          ]);
-          speakText('Verification failed. Adjust camera position.');
-        }
-      }, 1200);
+    } catch (err) {
+      // Aborted timeout or a genuine network failure. Never fabricate success.
+      const detail =
+        err instanceof DOMException && err.name === 'AbortError' ? 'timed out' : undefined;
+      view = errorView('network', detail);
     } finally {
+      clearTimeout(timeout);
       setIsVerifying(false);
     }
+
+    applyVerification(view);
   };
 
   // Update step progress on Express server
   const updateServerRepairStep = async (stepIdx: number, completed: boolean) => {
     try {
-      await fetch(`https://repair-ai.onrender.com/api/repairs/${repairId}/step`, {
+      await fetch(`${API_BASE}/api/repairs/${repairId}/step`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -415,9 +477,40 @@ function DiagnoseContent() {
       return;
     }
 
+    // Prefer the backend's authoritative verdict/nextStep over any hardcoded
+    // "+1" transition. The frontend never invents where the repair goes next.
+    if (verification?.repairComplete) {
+      setIsCompleted(true);
+      setVerification(null);
+      setDetectedComponents([]);
+      setVerificationLogs((prev) => [
+        ...prev,
+        '🏆 [SYSTEM] All steps processed. Device repair checklist completed!',
+      ]);
+      speakText('Congratulations! Repair guide completed. Preparing final report.');
+      return;
+    }
+
+    if (verification?.nextStep) {
+      const next = verification.nextStep;
+      setCurrentStepIdx(next.index);
+      setSafetyChecked(false);
+      setVerification(null);
+      setDetectedComponents([]);
+      setVerificationLogs((prev) => [
+        ...prev,
+        `📢 [COPILOT] Loaded Step ${next.index}: "${next.title}"`,
+      ]);
+      return;
+    }
+
+    // Fallback (offline / manual override with no backend nextStep): keep the
+    // existing sequential progression through the local scenario.
     if (currentStepIdx < activeScenario.steps.length) {
       setCurrentStepIdx((prev) => prev + 1);
       setSafetyChecked(false);
+      setVerification(null);
+      setDetectedComponents([]);
       setVerificationLogs((prev) => [
         ...prev,
         `📢 [COPILOT] Loaded Step ${currentStepIdx + 1}: "${activeScenario.steps[currentStepIdx].stepTitle}"`,
@@ -438,6 +531,8 @@ function DiagnoseContent() {
       setCurrentStepIdx((prev) => prev - 1);
       setSafetyChecked(false);
       setIsCompleted(false);
+      setVerification(null);
+      setDetectedComponents([]);
       setVerificationLogs((prev) => [
         ...prev,
         `📢 [COPILOT] Returned to Step ${currentStepIdx - 1}: "${activeScenario.steps[currentStepIdx - 2].stepTitle}"`,
@@ -482,7 +577,7 @@ function DiagnoseContent() {
     // Save report link on server if authenticated
     if (authToken && diagnosticId) {
       try {
-        await fetch('https://repair-ai.onrender.com/api/repairs/report', {
+        await fetch(`${API_BASE}/api/repairs/report`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -550,9 +645,11 @@ function DiagnoseContent() {
         {/* LEFT COLUMN: Camera & HUD (Col span 7) */}
         <div className="lg:col-span-7 flex flex-col gap-4">
           <CameraFeed
+            ref={cameraRef}
             scenarioId={scenarioId}
             components={activeScenario.components}
             activeComponentNames={activeComponentNames}
+            detectedComponents={detectedComponents}
           />
 
           {/* Machine Vision Status Panel */}
@@ -690,6 +787,109 @@ function DiagnoseContent() {
                         I confirm that the power supply is disconnected and safety measures are locked in.
                       </span>
                     </label>
+                  </div>
+                )}
+
+                {/* Live verification result — the backend is the source of truth.
+                    Rendered only after a verify attempt; never advances on its own. */}
+                {verification && (
+                  <div
+                    className={`rounded-xl border p-4 flex flex-col gap-3 ${
+                      verification.status === 'COMPLETED'
+                        ? 'border-primary/30 bg-primary/5'
+                        : verification.status === 'NOT_COMPLETED'
+                        ? 'border-amber-500/30 bg-amber-500/5'
+                        : verification.status === 'UNCERTAIN'
+                        ? 'border-yellow-500/30 bg-yellow-500/5'
+                        : 'border-red-500/30 bg-red-500/5'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="text-xs font-bold font-mono uppercase tracking-wider">
+                        {verification.status === 'COMPLETED' ? (
+                          <span className="flex items-center gap-1.5 text-primary">
+                            <CheckCircle2 className="w-4 h-4" /> Verified
+                          </span>
+                        ) : verification.status === 'NOT_COMPLETED' ? (
+                          <span className="flex items-center gap-1.5 text-amber-400">
+                            <AlertTriangle className="w-4 h-4" /> Not Complete
+                          </span>
+                        ) : verification.status === 'UNCERTAIN' ? (
+                          <span className="flex items-center gap-1.5 text-yellow-400">
+                            <HelpCircle className="w-4 h-4" /> Uncertain
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-1.5 text-red-400">
+                            <AlertTriangle className="w-4 h-4" /> Error
+                          </span>
+                        )}
+                      </div>
+                      {verification.confidencePercent != null && (
+                        <span className="text-[10px] font-mono font-bold text-gray-300">
+                          Confidence: {verification.confidencePercent}%
+                        </span>
+                      )}
+                    </div>
+
+                    <p className="text-xs text-gray-300 leading-relaxed">{verification.message}</p>
+
+                    {/* Camera guidance for uncertain / error states */}
+                    {verification.guidance && (
+                      <p className="text-[11px] text-yellow-300/90 leading-relaxed flex items-start gap-1.5">
+                        <span>🎥</span>
+                        <span>{verification.guidance}</span>
+                      </p>
+                    )}
+
+                    {/* Backend-authored next step (shown only on COMPLETED) */}
+                    {verification.status === 'COMPLETED' && verification.nextStep && (
+                      <div className="rounded-lg border border-white/10 bg-black/30 p-3 flex flex-col gap-1">
+                        <span className="text-[9px] font-mono font-bold uppercase tracking-wider text-primary">
+                          Next Step (Step {verification.nextStep.index})
+                        </span>
+                        <span className="text-xs font-bold text-white">{verification.nextStep.title}</span>
+                        {verification.nextStep.instruction && (
+                          <span className="text-[11px] text-gray-400 leading-relaxed">
+                            {verification.nextStep.instruction}
+                          </span>
+                        )}
+                        <span className="text-[10px] text-gray-500 mt-1">Press “Next” to continue.</span>
+                      </div>
+                    )}
+
+                    {verification.status === 'COMPLETED' && verification.repairComplete && (
+                      <div className="text-[11px] font-bold text-primary flex items-center gap-1.5">
+                        <Award className="w-3.5 h-3.5" /> Final step verified — press “Next” to finish.
+                      </div>
+                    )}
+
+                    {/* What the AI actually observed in the frame */}
+                    {verification.observations.length > 0 && (
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[9px] font-mono font-bold uppercase tracking-wider text-gray-500">
+                          What the AI saw
+                        </span>
+                        <ul className="list-disc list-inside text-[11px] text-gray-400 leading-relaxed">
+                          {verification.observations.map((obs, i) => (
+                            <li key={i}>{obs}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    {/* Weak-evidence reasons for non-completed verdicts */}
+                    {verification.status !== 'COMPLETED' && verification.warnings.length > 0 && (
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[9px] font-mono font-bold uppercase tracking-wider text-gray-500">
+                          Notes
+                        </span>
+                        <ul className="list-disc list-inside text-[11px] text-gray-500 leading-relaxed">
+                          {verification.warnings.map((w, i) => (
+                            <li key={i}>{w}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
                   </div>
                 )}
 
