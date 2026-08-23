@@ -1,22 +1,40 @@
 'use client';
 
-import React, { useRef, useEffect, useState } from 'react';
+import React, {
+  useRef,
+  useEffect,
+  useState,
+  forwardRef,
+  useImperativeHandle,
+} from 'react';
 import { Camera, CameraOff, Maximize2, Minimize2, Cpu, RefreshCw } from 'lucide-react';
 import { IComponent } from '@/utils/repairGuides';
+import { NormalizedComponent } from '@/utils/verifyClient';
+
+/** Imperative surface the repair page uses to grab a single frame on demand. */
+export interface CameraFeedHandle {
+  /** Capture the CURRENT video frame as a JPEG data URL, or null if unavailable. */
+  captureFrame: () => string | null;
+  /** True when a live webcam frame can actually be captured right now. */
+  hasLiveCamera: () => boolean;
+}
 
 interface CameraFeedProps {
   scenarioId: string;
   components: IComponent[];
   activeComponentNames: string[]; // Components related to current step to highlight
-  onFrameCapture?: (base64Image: string) => void;
+  /**
+   * Real AI-detected components from the latest /api/ai/verify response.
+   * Coordinates are NORMALIZED (0..1 fractions of the frame). When present these
+   * are drawn instead of the static scenario template boxes.
+   */
+  detectedComponents?: NormalizedComponent[];
 }
 
-export default function CameraFeed({
-  scenarioId,
-  components,
-  activeComponentNames,
-  onFrameCapture,
-}: CameraFeedProps) {
+const CameraFeed = forwardRef<CameraFeedHandle, CameraFeedProps>(function CameraFeed(
+  { scenarioId, components, activeComponentNames, detectedComponents = [] },
+  ref,
+) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [hasCamera, setHasCamera] = useState<boolean | null>(null);
@@ -59,6 +77,44 @@ export default function CameraFeed({
     };
   }, []);
 
+  /**
+   * Expose an on-demand, single-shot frame capture to the parent.
+   *
+   * This deliberately REPLACES the previous 3-second streaming interval: exactly
+   * one frame is produced per explicit call (i.e. per user "Verify" action), so
+   * frames are never continuously streamed to the backend/Gemini.
+   */
+  useImperativeHandle(
+    ref,
+    () => ({
+      captureFrame: (): string | null => {
+        const video = videoRef.current;
+        // No live webcam, or metadata not ready yet -> nothing to capture. The
+        // page falls back to the backend's no-image (simulated) path.
+        if (hasCamera !== true || !video || !video.videoWidth || !video.videoHeight) {
+          return null;
+        }
+        try {
+          const canvas = document.createElement('canvas');
+          // Capture at the video's NATIVE resolution so the frame keeps its true
+          // aspect ratio. The model then returns normalized (0..1) coordinates
+          // that map linearly back onto the displayed feed.
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) return null;
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          return canvas.toDataURL('image/jpeg', 0.7);
+        } catch (e) {
+          console.error('Frame capture error:', e);
+          return null;
+        }
+      },
+      hasLiveCamera: (): boolean => hasCamera === true,
+    }),
+    [hasCamera],
+  );
+
   // Periodic scanline/radar animation pulse
   useEffect(() => {
     const interval = setInterval(() => {
@@ -66,34 +122,6 @@ export default function CameraFeed({
     }, 50);
     return () => clearInterval(interval);
   }, []);
-
-  // Capture frame helper for backend verification simulation
-  useEffect(() => {
-    if (!onFrameCapture) return;
-
-    const interval = setInterval(() => {
-      if (hasCamera && videoRef.current) {
-        try {
-          const canvas = document.createElement('canvas');
-          canvas.width = 640;
-          canvas.height = 360;
-          const ctx = canvas.getContext('2d');
-          if (ctx) {
-            ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
-            onFrameCapture(dataUrl);
-          }
-        } catch (e) {
-          console.error('Frame capture error:', e);
-        }
-      } else {
-        // Mock base64 frame representation
-        onFrameCapture('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==');
-      }
-    }, 3000); // Send frame every 3s
-
-    return () => clearInterval(interval);
-  }, [hasCamera, onFrameCapture]);
 
   const toggleFullscreen = () => {
     if (!containerRef.current) return;
@@ -116,6 +144,30 @@ export default function CameraFeed({
     document.addEventListener('fullscreenchange', handleFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
   }, []);
+
+  // Decide which boxes to draw. Prefer REAL AI detections (normalized 0..1 →
+  // percentages of the container). Fall back to the scenario's static template
+  // boxes (authored on a 600x450 grid) when no AI result is available yet.
+  const hasAiBoxes = detectedComponents.length > 0;
+  const overlayBoxes = hasAiBoxes
+    ? detectedComponents.map((comp) => ({
+        name: comp.name,
+        confidence: comp.confidence, // 0..1 or null
+        leftPct: comp.boundingBox.x * 100,
+        topPct: comp.boundingBox.y * 100,
+        widthPct: comp.boundingBox.width * 100,
+        heightPct: comp.boundingBox.height * 100,
+        isActive: true, // Live AI detections are always the current focus.
+      }))
+    : components.map((comp) => ({
+        name: comp.name,
+        confidence: comp.confidence, // 0..1
+        leftPct: (comp.bbox[0] / 600) * 100,
+        topPct: (comp.bbox[1] / 450) * 100,
+        widthPct: (comp.bbox[2] / 600) * 100,
+        heightPct: (comp.bbox[3] / 450) * 100,
+        isActive: activeComponentNames.includes(comp.name),
+      }));
 
   return (
     <div
@@ -163,13 +215,13 @@ export default function CameraFeed({
         /* Tech HUD Simulator Fallback when webcam is unavailable */
         <div className="absolute inset-0 w-full h-full bg-[#030308] flex flex-col items-center justify-center overflow-hidden">
           {/* Cybergrid background */}
-          <div className="absolute inset-0 opacity-20 pointer-events-none" 
+          <div className="absolute inset-0 opacity-20 pointer-events-none"
             style={{
               backgroundImage: 'radial-gradient(circle, rgba(0, 240, 255, 0.1) 1px, transparent 1px)',
               backgroundSize: '20px 20px'
-            }} 
+            }}
           />
-          
+
           {/* Futuristic technical radar layout */}
           <div className="relative w-80 h-80 rounded-full border border-primary/20 flex items-center justify-center opacity-30 pointer-events-none scale-90 sm:scale-100">
             <div className="absolute w-64 h-64 rounded-full border border-dashed border-accent/25 animate-spin-slow" />
@@ -194,8 +246,8 @@ export default function CameraFeed({
       )}
 
       {/* AR HUD Scanning Line Animation overlay */}
-      <div 
-        className="absolute left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-primary to-transparent opacity-40 pointer-events-none" 
+      <div
+        className="absolute left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-primary to-transparent opacity-40 pointer-events-none"
         style={{
           top: `${Math.sin((scanPulse * Math.PI) / 180) * 50 + 50}%`
         }}
@@ -203,14 +255,8 @@ export default function CameraFeed({
 
       {/* AR HUD Bounding Box Overlay graphics */}
       <div className="absolute inset-0 pointer-events-none select-none z-10 w-full h-full">
-        {components.map((comp, idx) => {
-          const isActive = activeComponentNames.includes(comp.name);
-          // Coordinates in db are based on a 600x450 grid template.
-          // We render absolute positions as percentages so they are fluid.
-          const xPercent = (comp.bbox[0] / 600) * 100;
-          const yPercent = (comp.bbox[1] / 450) * 100;
-          const wPercent = (comp.bbox[2] / 600) * 100;
-          const hPercent = (comp.bbox[3] / 450) * 100;
+        {overlayBoxes.map((box, idx) => {
+          const isActive = box.isActive;
 
           return (
             <div
@@ -221,10 +267,10 @@ export default function CameraFeed({
                   : 'border-white/20 bg-white/2'
               }`}
               style={{
-                left: `${xPercent}%`,
-                top: `${yPercent}%`,
-                width: `${wPercent}%`,
-                height: `${hPercent}%`,
+                left: `${box.leftPct}%`,
+                top: `${box.topPct}%`,
+                width: `${box.widthPct}%`,
+                height: `${box.heightPct}%`,
               }}
             >
               {/* Box Corner Accents */}
@@ -240,11 +286,13 @@ export default function CameraFeed({
                     isActive ? 'bg-primary animate-pulse' : 'bg-white/40 text-white'
                   }`}
                 >
-                  {comp.name}
+                  {box.name}
                 </span>
-                <span className={`text-[7px] sm:text-[9px] font-mono font-bold ${isActive ? 'text-primary' : 'text-gray-400'}`}>
-                  {(comp.confidence * 100).toFixed(0)}%
-                </span>
+                {box.confidence != null && (
+                  <span className={`text-[7px] sm:text-[9px] font-mono font-bold ${isActive ? 'text-primary' : 'text-gray-400'}`}>
+                    {(box.confidence * 100).toFixed(0)}%
+                  </span>
+                )}
               </div>
 
               {/* Targets and guidelines for Active Component */}
@@ -261,4 +309,6 @@ export default function CameraFeed({
       </div>
     </div>
   );
-}
+});
+
+export default CameraFeed;
