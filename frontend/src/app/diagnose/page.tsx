@@ -276,12 +276,20 @@ function DiagnoseContent() {
     // the backend's no-image path. Tell the user and stop — no request is sent.
     const frame = cameraRef.current?.captureFrame() ?? null;
     if (!canVerifyWithFrame(frame)) {
+      // Distinguish "camera is still warming up" from "there is no camera":
+      // both used to produce the same dead end, so a one-second race looked
+      // identical to a permission failure.
+      const cameraLive = cameraRef.current?.hasLiveCamera() === true;
       setDiscoveryNotice(
-        'No live camera frame available. Allow camera access, point it at the device, then scan again.'
+        cameraLive
+          ? 'The camera is still starting up. Wait a moment, then scan again.'
+          : 'No live camera frame available. Allow camera access, point it at the device, then scan again.'
       );
       setVerificationLogs((prev) => [
         ...prev,
-        '🚫 [VISION] No live camera frame. Point the camera at the device and scan again.',
+        cameraLive
+          ? '🚫 [VISION] Camera not ready yet — no frame captured, so no request was sent.'
+          : '🚫 [VISION] No live camera. Allow camera access and scan again. No request was sent.',
       ]);
       return;
     }
@@ -292,8 +300,30 @@ function DiagnoseContent() {
     setDetectedComponents([]);
     setVerificationLogs(['⚡ [SYSTEM] Scanning frame to identify device...']);
 
+    // Where the request actually goes and what it carries. Safe metadata only:
+    // the frame bytes are never logged, and no credential is ever logged.
+    const detectUrl = `${API_BASE}/api/ai/detect`;
+    console.info('[discovery] POST', detectUrl, {
+      apiBase: API_BASE,
+      bodyKeys: ['image'],
+      frameMimeType: frame.slice(5, frame.indexOf(';')),
+      frameApproxBytes: Math.round(((frame.length - (frame.indexOf(',') + 1)) * 3) / 4),
+    });
+    if (
+      typeof window !== 'undefined' &&
+      /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname) &&
+      !/^https?:\/\/(localhost|127\.0\.0\.1)/.test(API_BASE)
+    ) {
+      // NEXT_PUBLIC_* values are inlined when the dev server starts, so a server
+      // started before .env.local existed keeps the deployed default.
+      console.warn(
+        `[discovery] API base is ${API_BASE} while the page is on localhost. Restart the dev server if you expected the local backend.`
+      );
+    }
+    setVerificationLogs((prev) => [...prev, `📡 [NETWORK] POST ${detectUrl}`]);
+
     try {
-      const res = await fetch(`${API_BASE}/api/ai/detect`, {
+      const res = await fetch(detectUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -308,6 +338,28 @@ function DiagnoseContent() {
       }
 
       const data = await res.json();
+
+      // The exact safe shape that came back. `source` is the answer to "did the
+      // real vision provider run?", and `warnings` carries the reason when it
+      // did not — previously both were dropped on the floor here.
+      const warnings: string[] = Array.isArray(data?.warnings) ? data.warnings : [];
+      console.info('[discovery] response', {
+        status: res.status,
+        source: data?.source ?? null,
+        hasDevice: !!data?.device,
+        deviceType: data?.deviceType ?? null,
+        confidenceScore: data?.confidenceScore ?? null,
+        componentCount: Array.isArray(data?.detectedComponents)
+          ? data.detectedComponents.length
+          : 0,
+        scenarioId: data?.scenario?.id ?? null,
+        warnings,
+      });
+      setVerificationLogs((prev) => [
+        ...prev,
+        `📥 [NETWORK] HTTP ${res.status} · source=${data?.source ?? 'unknown'}`,
+        ...warnings.map((w) => `⚠️ [MODEL] ${w}`),
+      ]);
 
       // Draw whatever the model actually saw, regardless of resolution outcome.
       setDetectedComponents(
@@ -372,14 +424,21 @@ function DiagnoseContent() {
           '⛔ [RESOLVER] No supported repair procedure matches this device.',
         ]);
       } else {
-        // Nothing identifiable in the frame.
+        // Nothing identifiable in the frame. Distinguish "the model looked and
+        // saw nothing" from "the vision provider never ran": the second is a
+        // configuration failure, and it used to be reported identically.
+        const providerFailed = warnings.some((w) => /analysis failed/i.test(w));
         setDiscoveredDevice(null);
         setDiscoveryNotice(
-          'No device could be identified. Move closer, improve lighting, and scan again.'
+          providerFailed
+            ? 'The vision service did not run, so nothing could be identified. Check the backend log and the AI provider configuration.'
+            : 'No device could be identified. Move closer, improve lighting, and scan again.'
         );
         setVerificationLogs((prev) => [
           ...prev,
-          '⛔ [VISION] No device could be identified in the frame.',
+          providerFailed
+            ? '⛔ [VISION] Vision provider unavailable — no identification was attempted.'
+            : '⛔ [VISION] No device could be identified in the frame.',
         ]);
       }
     } catch (e) {
