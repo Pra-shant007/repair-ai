@@ -39,43 +39,87 @@ const CameraFeed = forwardRef<CameraFeedHandle, CameraFeedProps>(function Camera
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [hasCamera, setHasCamera] = useState<boolean | null>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
+  /** True once the video element reports real dimensions, i.e. a frame exists. */
+  const [videoReady, setVideoReady] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [scanPulse, setScanPulse] = useState(0);
 
+  /**
+   * Mirror of `stream` for the unmount handler, which is registered once and
+   * would otherwise close over the initial `null` and never stop a track.
+   */
+  const streamRef = useRef<MediaStream | null>(null);
+
+  /** Stop every track, releasing the camera and its indicator light. */
+  const stopStream = (target: MediaStream | null) => {
+    target?.getTracks().forEach((track) => track.stop());
+  };
+
   // Start webcam
   const startCamera = async () => {
     setCameraError(null);
+    setVideoReady(false);
     try {
-      if (stream) {
-        stream.getTracks().forEach((track) => track.stop());
-      }
+      stopStream(streamRef.current);
 
       const mediaStream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       });
 
+      streamRef.current = mediaStream;
       setStream(mediaStream);
-      if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
-      }
       setHasCamera(true);
+      // srcObject is deliberately NOT assigned here. The <video> element renders
+      // only once `hasCamera` is true, so on first run `videoRef.current` is
+      // still null at this point and the assignment silently did nothing. The
+      // effect below attaches the stream once the element actually exists.
     } catch (err) {
       console.warn('Webcam access failed or not available, falling back to simulator:', err);
       setHasCamera(false);
-      setCameraError('Webcam not accessible. Running in simulation mode.');
+      setCameraError(
+        err instanceof Error && err.name === 'NotAllowedError'
+          ? 'Camera permission was denied, so no frame can be captured for identification.'
+          : 'Webcam not accessible. Running in simulation mode.',
+      );
     }
   };
 
   useEffect(() => {
     startCamera();
     return () => {
-      if (stream) {
-        stream.getTracks().forEach((track) => track.stop());
-      }
+      stopStream(streamRef.current);
+      streamRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /**
+   * Attach the live stream to the <video> element.
+   *
+   * Runs after any render in which either side changed, which is what makes the
+   * late attachment work: the element is mounted by the SAME state update that
+   * produces the stream, so the ref can only be populated after `startCamera`
+   * has already returned. Without this the feed has no source, `videoWidth`
+   * stays 0, and `captureFrame()` returns null forever — no frame means no
+   * request, no vision call, and no device identification.
+   */
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !stream) return;
+
+    if (video.srcObject !== stream) {
+      video.srcObject = stream;
+    }
+    // `autoPlay` is only reliable when the source is present at mount, so
+    // playback is started explicitly for this late attachment.
+    void video.play().catch(() => {
+      /* Autoplay can be refused; readiness simply stays false. */
+    });
+
+    if (video.videoWidth > 0 && video.videoHeight > 0) setVideoReady(true);
+  }, [stream, hasCamera]);
 
   /**
    * Expose an on-demand, single-shot frame capture to the parent.
@@ -92,6 +136,15 @@ const CameraFeed = forwardRef<CameraFeedHandle, CameraFeedProps>(function Camera
         // No live webcam, or metadata not ready yet -> nothing to capture. The
         // page falls back to the backend's no-image (simulated) path.
         if (hasCamera !== true || !video || !video.videoWidth || !video.videoHeight) {
+          // Safe metadata only: never the frame itself.
+          console.warn('[CameraFeed] captureFrame -> null', {
+            hasCamera,
+            videoElementMounted: !!video,
+            srcObjectAttached: !!video?.srcObject,
+            videoWidth: video?.videoWidth ?? 0,
+            videoHeight: video?.videoHeight ?? 0,
+            readyState: video?.readyState ?? -1,
+          });
           return null;
         }
         try {
@@ -104,7 +157,17 @@ const CameraFeed = forwardRef<CameraFeedHandle, CameraFeedProps>(function Camera
           const ctx = canvas.getContext('2d');
           if (!ctx) return null;
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          return canvas.toDataURL('image/jpeg', 0.7);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+          // Safe metadata only: existence, MIME type, approximate size and
+          // dimensions. The image bytes are never logged.
+          console.info('[CameraFeed] captureFrame -> frame', {
+            frameExists: dataUrl.length > 0,
+            mimeType: dataUrl.slice(5, dataUrl.indexOf(';')),
+            approxBytes: Math.round(((dataUrl.length - (dataUrl.indexOf(',') + 1)) * 3) / 4),
+            width: canvas.width,
+            height: canvas.height,
+          });
+          return dataUrl;
         } catch (e) {
           console.error('Frame capture error:', e);
           return null;
@@ -180,8 +243,12 @@ const CameraFeed = forwardRef<CameraFeedHandle, CameraFeedProps>(function Camera
       <div className="absolute top-4 left-4 right-4 z-20 flex items-center justify-between pointer-events-none">
         <div className="flex items-center gap-2">
           <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/70 backdrop-blur-md border border-white/10 text-[10px] text-gray-300 font-mono font-bold">
-            <span className={`w-2 h-2 rounded-full ${hasCamera ? 'bg-primary animate-pulse' : 'bg-purple-500'}`} />
-            {hasCamera ? 'LIVE WEBCAM' : 'SIMULATION FEED'}
+            <span
+              className={`w-2 h-2 rounded-full ${
+                hasCamera ? (videoReady ? 'bg-primary animate-pulse' : 'bg-amber-400 animate-pulse') : 'bg-purple-500'
+              }`}
+            />
+            {hasCamera ? (videoReady ? 'LIVE WEBCAM' : 'CAMERA STARTING…') : 'SIMULATION FEED'}
           </span>
           {hasCamera && (
             <button
@@ -209,6 +276,11 @@ const CameraFeed = forwardRef<CameraFeedHandle, CameraFeedProps>(function Camera
           autoPlay
           playsInline
           muted
+          onLoadedMetadata={(e) => {
+            const el = e.currentTarget;
+            if (el.videoWidth > 0 && el.videoHeight > 0) setVideoReady(true);
+          }}
+          onCanPlay={() => setVideoReady(true)}
           className="w-full h-full object-cover select-none"
         />
       ) : (
@@ -241,6 +313,20 @@ const CameraFeed = forwardRef<CameraFeedHandle, CameraFeedProps>(function Camera
             <p className="text-xs text-gray-500 max-w-xs leading-relaxed">
               Real-time feed simulator rendering digital overlays. Align your device within the scanning field.
             </p>
+            {/* Surfaced so a permission denial is visible instead of silent: no
+                webcam means no frame, and no frame means no identification. */}
+            {cameraError && (
+              <p className="text-[11px] text-amber-400/90 max-w-xs leading-relaxed font-mono">
+                {cameraError}
+              </p>
+            )}
+            <button
+              onClick={startCamera}
+              className="mt-1 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-[11px] text-gray-300 hover:text-white transition-colors cursor-pointer font-mono"
+            >
+              <RefreshCw className="w-3 h-3" />
+              Enable camera
+            </button>
           </div>
         </div>
       )}

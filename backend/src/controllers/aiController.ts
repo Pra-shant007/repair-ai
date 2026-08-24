@@ -451,7 +451,7 @@ export const queryAssistant = async (req: AuthenticatedRequest, res: Response) =
       : null;
 
     const model = genAI.getGenerativeModel({
-      model: "gemini-2.0-flash"
+      model: "gemini-3.6-flash"
     });
 
     const prompt = `

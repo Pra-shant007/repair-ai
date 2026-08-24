@@ -327,7 +327,7 @@ export class GeminiProvider implements AiProvider {
       throw new GeminiProviderError('Gemini provider requires an API key.');
     }
     this.apiKey = options.apiKey;
-    this.modelName = options.model ?? 'gemini-2.0-flash';
+    this.modelName = options.model ?? 'gemini-3.6-flash';
     this.timeoutMs = options.timeoutMs ?? 20000;
     this.client = new GoogleGenerativeAI(this.apiKey);
   }
